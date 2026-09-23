@@ -21,6 +21,7 @@ import numpy as np
 from napari.components.dims import RangeTuple
 from napari.layers import Points
 from napari.layers.base import ActionType
+from scipy.interpolate import interp1d
 
 from movement.napari.layer_styles import EDITED_POINT_SYMBOL
 
@@ -38,6 +39,10 @@ POINTS_PROPERTIES_KEY: str = "movement_points_properties"
 DATASET_ATTRS_KEY: str = "movement_dataset_attrs"
 TRACKS_LAYER_KEY: str = "movement_tracks_layer"
 MAX_FRAME_IDX_KEY: str = "movement_max_frame_idx"
+
+# Interpolation methods offered when filling a run of frames between two
+# anchor points (the ``kind`` argument of ``scipy.interpolate.interp1d``).
+INTERPOLATION_METHODS: tuple[str, ...] = ("linear", "nearest", "cubic")
 
 # Keep a set of viewers already wired by connect_viewer_callbacks,
 # so we don't wire them twice. We use a WeakSet so tracking a viewer here
@@ -68,6 +73,22 @@ def active_movement_points_layer(viewer):
         if is_movement_points_layer(layer):
             return getattr(layer, "__wrapped__", layer)
     return None
+
+
+def track_row_indices(
+    layer: Points, individual: str, keypoint: str | None = None
+) -> np.ndarray:
+    """Return the row indices of one track's points in a Points layer.
+
+    A track is all the points of one ``individual`` and, if the layer
+    has a ``keypoint`` property, one ``keypoint``. Pass ``keypoint=None``
+    for layers without keypoints (e.g. bounding boxes).
+    """
+    props = layer.properties
+    mask = np.asarray(props["individual"]) == individual
+    if keypoint is not None:
+        mask &= np.asarray(props["keypoint"]) == keypoint
+    return np.flatnonzero(mask)
 
 
 # ---- Callbacks with viewer lifetime --------------------
@@ -246,6 +267,102 @@ def remove_from_tracks_layer(points_layer, removed_indices):
     }
 
     set_tracks_layer_data(tracks_layer, tracks_data, tracks_properties)
+
+
+def interpolate_track_between(
+    layer: Points,
+    individual: str,
+    keypoint: str | None,
+    start_frame: int,
+    end_frame: int,
+    method: str = "linear",
+) -> list[int]:
+    """Overwrite a track's points between two anchor frames by interpolation.
+
+    The points of the (``individual``, ``keypoint``) track that lie
+    strictly between ``start_frame`` and ``end_frame`` are moved to
+    positions interpolated from the rest of the track, with the two
+    anchor frames left untouched. This is meant for runs of consecutive
+    frames where a keypoint is consistently misplaced: correct the frame
+    before and the frame after the run, then interpolate across it.
+
+    The moved points are announced through the layer's ``events.data``
+    with ``ActionType.CHANGED`` (exactly as napari does after a drag), so
+    :func:`on_points_data_changed` marks them as edited, sets their
+    confidence to NaN and keeps the Tracks layer in sync.
+
+    Parameters
+    ----------
+    layer
+        A movement Points layer.
+    individual
+        Name of the individual whose track to interpolate.
+    keypoint
+        Name of the keypoint to interpolate, or None for a layer
+        without a ``keypoint`` property.
+    start_frame, end_frame
+        The two anchor frames. Both must hold a point for this track.
+    method
+        Interpolation method, one of ``INTERPOLATION_METHODS``
+        (passed as ``kind`` to :class:`scipy.interpolate.interp1d`).
+        With ``cubic``, every point of the track outside the range
+        supports the spline, not just the two anchors.
+
+    Returns
+    -------
+    list[int]
+        Row indices (in ``layer.data``) of the points that were moved.
+        Empty if the track has no points strictly between the anchors,
+        e.g. because those frames are missing (NaN) -- such gaps are
+        not filled.
+
+    Raises
+    ------
+    ValueError
+        If either anchor frame has no point for this track, or if the
+        track has too few points for ``method``.
+
+    """
+    if start_frame >= end_frame:
+        raise ValueError("start_frame must be smaller than end_frame.")
+    track_name = f"'{individual}'" + (
+        f" / '{keypoint}'" if keypoint is not None else ""
+    )
+    rows = track_row_indices(layer, individual, keypoint)
+    frames = layer.data[rows, 0]
+    for anchor in (start_frame, end_frame):
+        if not np.any(frames == anchor):
+            raise ValueError(
+                f"Cannot interpolate {track_name}: "
+                f"no point at anchor frame {anchor}."
+            )
+
+    in_between = (frames > start_frame) & (frames < end_frame)
+    if not in_between.any():
+        return []
+    try:
+        interpolator = interp1d(
+            frames[~in_between],
+            layer.data[rows[~in_between], 1:],
+            kind=method,  # type: ignore[call-overload]
+            axis=0,
+        )
+    except ValueError as e:
+        raise ValueError(
+            f"Cannot interpolate {track_name} with method '{method}': {e}"
+        ) from e
+
+    moved_indices = rows[in_between].tolist()
+    layer.data[moved_indices, 1:] = interpolator(frames[in_between])
+    layer.refresh()
+    layer.events.data(
+        value=layer.data,
+        action=ActionType.CHANGED,
+        data_indices=tuple(moved_indices),
+        vertex_indices=((),),
+    )
+    layer.events.features()
+    return moved_indices
 
 
 def set_tracks_layer_data(tracks_layer, data, properties):

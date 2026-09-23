@@ -2,10 +2,13 @@
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 from napari.layers.base import ActionType
+from napari.utils.notifications import show_warning
 from napari.viewer import Viewer
 from qt_niu.collapsible_widget import CollapsibleWidgetContainer
 from qtpy.QtCore import QTimer
+from qtpy.QtWidgets import QMessageBox
 
 if TYPE_CHECKING:
     from qtpy.QtWidgets import QWidget
@@ -16,7 +19,9 @@ from movement.napari.edit_timeline_widget import (
 )
 from movement.napari.layer_wiring import (
     active_movement_points_layer,
+    interpolate_track_between,
     is_movement_points_layer,
+    track_row_indices,
 )
 from movement.napari.loader_widgets import DataLoader
 from movement.napari.regions_widget import RegionsWidget
@@ -51,6 +56,9 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
         self.edit_controls.show_individuals_toggled.connect(
             self._on_show_individuals_toggled
         )
+        self.edit_controls.interpolate_mode_toggled.connect(
+            self._on_interpolate_mode_toggled
+        )
         self.add_widget(
             self.edit_controls,
             collapsible=True,
@@ -84,6 +92,9 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
         napari_viewer.layers.selection.events.active.connect(
             self._show_individuals_enabled
         )
+        napari_viewer.layers.selection.events.active.connect(
+            self._update_track_choices
+        )
 
     def _on_layer_inserted(self, event) -> None:
         """Keep the edit timeline section collapsed until a point is edited."""
@@ -91,6 +102,7 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
         if not is_movement_points_layer(layer):
             return  # ignore any layer that is not a movement Points layer
         self._show_individuals_enabled()
+        self._update_track_choices()
         # Open the edit timeline section as soon as a point is edited
         # on this layer.
         layer.events.data.connect(self._on_points_edited)
@@ -121,6 +133,12 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
             self.edit_timeline_widget = EditTimelineWidget(self._viewer)
             self.edit_timeline_widget.set_show_individuals(
                 self.edit_controls.show_individuals_checkbox.isChecked()
+            )
+            self.edit_timeline_widget.set_interpolate_mode(
+                self.edit_controls.interpolate_button.isChecked()
+            )
+            self.edit_timeline_widget.anchors_selected.connect(
+                self._on_anchors_selected
             )
             self._edit_timeline_dock_widget = (
                 self._viewer.window.add_dock_widget(
@@ -159,6 +177,95 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
         """Forward the "Display individuals" checkbox to the timeline."""
         if self.edit_timeline_widget is not None:
             self.edit_timeline_widget.set_show_individuals(checked)
+
+    def _on_interpolate_mode_toggled(self, checked: bool) -> None:
+        """Forward the "Interpolate between anchors" button to the timeline.
+
+        Entering the mode also opens the edit section (and with it the
+        timeline), since the anchors are picked by clicking on it.
+        """
+        if checked and not self._edit_timeline_collapsible.isExpanded():
+            self._edit_timeline_collapsible.expand()
+        if self.edit_timeline_widget is not None:
+            self.edit_timeline_widget.set_interpolate_mode(checked)
+
+    def _update_track_choices(self, *_) -> None:
+        """Populate the individual/keypoint dropdowns from the active layer."""
+        layer = active_movement_points_layer(self._viewer)
+        if layer is None:
+            return
+        props = layer.properties
+        individuals = list(dict.fromkeys(props["individual"]))
+        keypoints = (
+            list(dict.fromkeys(props["keypoint"]))
+            if "keypoint" in props
+            else None
+        )
+        self.edit_controls.set_track_choices(individuals, keypoints)
+
+    def _on_anchors_selected(self, start_frame: int, end_frame: int) -> None:
+        """Interpolate the chosen track(s) between two anchor frames.
+
+        The track(s) and method come from the dropdowns in the edit
+        controls. Points between the anchors that were already edited
+        by hand are only overwritten after the user confirms.
+        """
+        timeline = self.edit_timeline_widget
+        layer = timeline.active_layer if timeline is not None else None
+        if timeline is None or layer is None:
+            return
+        individual = self.edit_controls.individual_combo.currentText()
+        keypoint = self.edit_controls.selected_keypoint
+        method = self.edit_controls.method_combo.currentText()
+        props = layer.properties
+        if keypoint is None and "keypoint" in props:
+            keypoints = list(dict.fromkeys(props["keypoint"]))
+        else:
+            keypoints = [keypoint]
+
+        if not self._confirm_overwriting_edited_points(
+            layer, individual, keypoints, start_frame, end_frame
+        ):
+            return
+
+        n_moved, problems = 0, []
+        for kpt in keypoints:
+            try:
+                n_moved += len(
+                    interpolate_track_between(
+                        layer, individual, kpt, start_frame, end_frame, method
+                    )
+                )
+            except ValueError as e:
+                problems.append(str(e))
+        if problems:
+            show_warning("\n".join(problems))
+        if n_moved:
+            timeline.add_interpolated_span(start_frame, end_frame, individual)
+
+    def _confirm_overwriting_edited_points(
+        self, layer, individual, keypoints, start_frame, end_frame
+    ) -> bool:
+        """Ask before interpolating over points already edited by hand."""
+        edited = layer.properties.get("edited")
+        if edited is None:
+            return True
+        frames = layer.data[:, 0]
+        rows = np.concatenate(
+            [track_row_indices(layer, individual, kpt) for kpt in keypoints]
+        ).astype(int)
+        in_between = (frames[rows] > start_frame) & (frames[rows] < end_frame)
+        n_edited = int(np.count_nonzero(edited[rows][in_between]))
+        if n_edited == 0:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Overwrite edited points?",
+            f"{n_edited} point(s) of '{individual}' between frames "
+            f"{start_frame} and {end_frame} were already edited. "
+            "Overwrite them with interpolated positions?",
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def _show_individuals_enabled(self, *_) -> None:
         """Enable "Display individuals" only for multi-individual data.

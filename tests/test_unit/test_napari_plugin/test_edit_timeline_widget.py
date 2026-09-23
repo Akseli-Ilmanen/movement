@@ -11,7 +11,9 @@ from napari.utils.theme import get_theme
 
 from movement.napari.edit_timeline_widget import (
     DRAG_THRESHOLD_PIXELS,
+    INTERPOLATE_TITLE,
     MIN_VISIBLE_FRAMES,
+    TIMELINE_TITLE,
     EditTimelineWidget,
 )
 from movement.napari.loader_widgets import POINTS_PROPERTIES_KEY
@@ -549,3 +551,118 @@ def test_bar_color_lookup_falls_back_without_individual_property(
     color_of = edit_timeline_widget._bar_color_lookup()
 
     assert color_of("id_0") == edit_timeline_widget._edit_bar_color
+
+
+# ---- Interpolate mode --------------------
+
+
+@pytest.fixture
+def interpolating_timeline(loader_with_edited_point):
+    """Return an ``EditTimelineWidget`` in interpolate mode (with a point
+    edited on frame 2), plus the list of ``(start, end)`` pairs it emits.
+    """
+    edit_timeline_widget = EditTimelineWidget(loader_with_edited_point.viewer)
+    edit_timeline_widget.set_interpolate_mode(True)
+    emitted = []
+    edit_timeline_widget.anchors_selected.connect(
+        lambda start, end: emitted.append((start, end))
+    )
+    return edit_timeline_widget, emitted
+
+
+def test_two_clicks_in_interpolate_mode_emit_sorted_anchors(
+    interpolating_timeline, click_on_timeline
+):
+    """The first click is held (and marked) until a second completes it.
+
+    Clicks snap to a nearby edited bar (frame 2 here), else to the
+    nearest frame; the pair is emitted in ascending order regardless
+    of click order, and the viewer is not moved.
+    """
+    edit_timeline_widget, emitted = interpolating_timeline
+    viewer = edit_timeline_widget.viewer
+    frame_before = viewer.dims.current_step[0]
+
+    click_on_timeline(edit_timeline_widget, xdata=5.3)
+    assert edit_timeline_widget._pending_anchor == 5
+    assert edit_timeline_widget._anchor_line is not None
+    assert emitted == []
+
+    click_on_timeline(edit_timeline_widget, xdata=2.2)  # snaps to bar
+    assert emitted == [(2, 5)]
+    assert edit_timeline_widget._pending_anchor is None
+    assert edit_timeline_widget._anchor_line is None
+    assert viewer.dims.current_step[0] == frame_before
+
+
+def test_clicking_the_same_frame_twice_keeps_waiting(
+    interpolating_timeline, click_on_timeline
+):
+    """A repeat click on the pending anchor does not complete the pair."""
+    edit_timeline_widget, emitted = interpolating_timeline
+    click_on_timeline(edit_timeline_widget, xdata=5.2)
+    click_on_timeline(edit_timeline_widget, xdata=4.8)
+    assert emitted == []
+    assert edit_timeline_widget._pending_anchor == 5
+
+
+def test_anchor_clicks_are_clamped_to_the_frame_range(
+    interpolating_timeline, click_on_timeline
+):
+    """Clicks beyond the last frame land on the last frame."""
+    edit_timeline_widget, _ = interpolating_timeline
+    click_on_timeline(edit_timeline_widget, xdata=1e6)
+    assert edit_timeline_widget._pending_anchor == int(
+        edit_timeline_widget._max_frame
+    )
+
+
+@pytest.mark.parametrize("how", ["double_click", "leave_mode"])
+def test_pending_anchor_is_discarded(
+    interpolating_timeline, click_on_timeline, how
+):
+    """Double-clicking or leaving interpolate mode forgets a lone anchor."""
+    edit_timeline_widget, emitted = interpolating_timeline
+    click_on_timeline(edit_timeline_widget, xdata=5.0)
+
+    if how == "double_click":
+        click_on_timeline(edit_timeline_widget, dblclick=True)
+    else:
+        edit_timeline_widget.set_interpolate_mode(False)
+        assert edit_timeline_widget.ax.get_title() == TIMELINE_TITLE
+
+    assert edit_timeline_widget._pending_anchor is None
+    assert edit_timeline_widget._anchor_line is None
+    assert emitted == []
+
+
+def test_interpolate_mode_sets_the_title(interpolating_timeline):
+    """The axes title tells the user what the clicks now do."""
+    edit_timeline_widget, _ = interpolating_timeline
+    assert edit_timeline_widget.ax.get_title() == INTERPOLATE_TITLE
+
+
+def test_interpolated_span_is_drawn_and_survives_redraws(
+    loader_with_edited_point,
+):
+    """A span is drawn dashed between its anchors and kept across
+    redraws, until the active layer changes.
+    """
+    edit_timeline_widget = EditTimelineWidget(loader_with_edited_point.viewer)
+    edit_timeline_widget.add_interpolated_span(2, 6, "id_0")
+
+    assert len(edit_timeline_widget._span_lines) == 1
+    (span,) = edit_timeline_widget._span_lines
+    (segment,) = span.get_segments()
+    assert [segment[0][0], segment[1][0]] == [2, 6]
+    (_, dash_pattern), *_ = span.get_linestyle()
+    assert dash_pattern is not None  # dashed, not solid
+
+    edit_timeline_widget.set_show_individuals(True)  # triggers a redraw
+    assert len(edit_timeline_widget._span_lines) == 1
+
+    edit_timeline_widget.active_layer = None
+    edit_timeline_widget._set_active_layer(
+        loader_with_edited_point.points_layer
+    )
+    assert edit_timeline_widget._span_lines == []

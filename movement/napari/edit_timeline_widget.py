@@ -16,9 +16,18 @@ from napari.layers.base import ActionType
 from napari.utils.theme import get_theme
 from napari.viewer import Viewer
 from qtpy.QtCore import QTimer, Signal
-from qtpy.QtWidgets import QCheckBox, QLabel, QVBoxLayout, QWidget
+from qtpy.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QFormLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from movement.napari.layer_wiring import (
+    INTERPOLATION_METHODS,
     MAX_FRAME_IDX_KEY,
     POINTS_PROPERTIES_KEY,
     active_movement_points_layer,
@@ -26,6 +35,7 @@ from movement.napari.layer_wiring import (
 )
 
 if TYPE_CHECKING:
+    from matplotlib.lines import Line2D
     from napari.layers import Points
 
 # A click never lands exactly on a frame (e.g. 42.3, not 42), so treat
@@ -40,6 +50,14 @@ ZOOM_OUT_FACTOR = 1.25
 # the start of a pan drag (avoids a shaky click being read as a pan).
 DRAG_THRESHOLD_PIXELS = 3
 
+# Keypoint dropdown entry meaning "every keypoint of the individual".
+ALL_KEYPOINTS = "all keypoints"
+
+TIMELINE_TITLE = "Edited frames"
+INTERPOLATE_TITLE = (
+    "Interpolate: click the first anchor frame, then the second"
+)
+
 
 class EditControlsWidget(QWidget):
     """Sidebar controls for the edited-frames timeline.
@@ -50,14 +68,19 @@ class EditControlsWidget(QWidget):
     """
 
     show_individuals_toggled = Signal(bool)
+    interpolate_mode_toggled = Signal(bool)
 
     def __init__(self, parent=None):
-        """Initialise the instructions label and display checkbox."""
+        """Initialise the instructions label and the edit controls."""
         super().__init__(parent=parent)
         instructions = QLabel(
             "Use the points layer controls to move or delete keypoints. "
             "Frames with edited points are flagged as coloured bars on the "
-            "timeline below. Click a bar to jump to an edited frame."
+            "timeline below. Click a bar to jump to an edited frame.\n\n"
+            "To fix a run of misplaced frames, correct the frame before and "
+            "the frame after the run, then press 'Interpolate between "
+            "anchors' and click those two frames on the timeline. The "
+            "points in between are re-positioned by interpolation."
         )
         instructions.setWordWrap(True)
 
@@ -70,10 +93,65 @@ class EditControlsWidget(QWidget):
             self.show_individuals_toggled
         )
 
+        # Which track(s) to interpolate, and how. The individual and
+        # keypoint dropdowns are (re)populated from the active layer by
+        # MovementMetaWidget via set_track_choices.
+        self.individual_combo = QComboBox()
+        self.individual_combo.setObjectName("individual_combo")
+        self.keypoint_combo = QComboBox()
+        self.keypoint_combo.setObjectName("keypoint_combo")
+        self.method_combo = QComboBox()
+        self.method_combo.setObjectName("method_combo")
+        self.method_combo.addItems(INTERPOLATION_METHODS)
+        self.interpolate_button = QPushButton("Interpolate between anchors")
+        self.interpolate_button.setObjectName("interpolate_button")
+        self.interpolate_button.setCheckable(True)
+        self.interpolate_button.setEnabled(False)  # until data is loaded
+        self.interpolate_button.toggled.connect(self.interpolate_mode_toggled)
+
+        interpolate_form = QFormLayout()
+        interpolate_form.addRow("individual:", self.individual_combo)
+        interpolate_form.addRow("keypoint:", self.keypoint_combo)
+        interpolate_form.addRow("method:", self.method_combo)
+        interpolate_form.addRow(self.interpolate_button)
+
         layout = QVBoxLayout()
         layout.addWidget(instructions)
         layout.addWidget(self.show_individuals_checkbox)
+        layout.addLayout(interpolate_form)
         self.setLayout(layout)
+
+    def set_track_choices(
+        self, individuals: list[str], keypoints: list[str] | None
+    ) -> None:
+        """Populate the individual and keypoint dropdowns.
+
+        ``keypoints`` is None for a layer without a ``keypoint`` property
+        (e.g. bounding boxes), which leaves the keypoint dropdown empty
+        and disabled. Otherwise the dropdown also offers ``ALL_KEYPOINTS``,
+        to interpolate every keypoint of the chosen individual at once.
+        The current selections are kept if still available.
+        """
+        for combo, items in (
+            (self.individual_combo, individuals),
+            (
+                self.keypoint_combo,
+                [] if keypoints is None else [ALL_KEYPOINTS, *keypoints],
+            ),
+        ):
+            current = combo.currentText()
+            combo.clear()
+            combo.addItems(items)
+            if current in items:
+                combo.setCurrentText(current)
+        self.keypoint_combo.setEnabled(keypoints is not None)
+        self.interpolate_button.setEnabled(bool(individuals))
+
+    @property
+    def selected_keypoint(self) -> str | None:
+        """The keypoint to interpolate, or None for all keypoints."""
+        keypoint = self.keypoint_combo.currentText()
+        return None if keypoint in ("", ALL_KEYPOINTS) else keypoint
 
 
 class EditTimelineWidget(QWidget):
@@ -88,7 +166,17 @@ class EditTimelineWidget(QWidget):
     that individual's points in the Points layer. A playhead
     line marks the frame currently shown in the viewer. Scroll to zoom
     in/out on the timeline, and click a bar to jump to that frame.
+
+    With :meth:`set_interpolate_mode` on, clicks instead pick two anchor
+    frames (snapping to a nearby edited-frame bar, since anchors are
+    usually frames the user just corrected). Once both are picked,
+    ``anchors_selected`` is emitted with the two frames in ascending
+    order, and the widget owning the timeline does the interpolation.
+    Interpolated runs are then shown as a dashed line between the anchors
+    (see :meth:`add_interpolated_span`).
     """
+
+    anchors_selected = Signal(int, int)
 
     def __init__(self, napari_viewer: Viewer, parent=None):
         """Initialise the widget and connect it to viewer events."""
@@ -108,6 +196,11 @@ class EditTimelineWidget(QWidget):
         self._press_event = None
         self._pan_scale = 0.0
         self._dragged = False
+        self._interpolate_mode = False
+        self._pending_anchor: int | None = None
+        self._anchor_line: Line2D | None = None
+        self._interpolated_spans: list[tuple[int, int, str]] = []
+        self._span_lines: list = []
 
         self.figure = Figure(figsize=(6, 2.5))
         self.canvas = FigureCanvas(self.figure)
@@ -146,7 +239,7 @@ class EditTimelineWidget(QWidget):
         self.ax.set_yticks([])
         self.ax.set_ylim(0, 1)
         self.ax.set_xlabel("frame")
-        self.ax.set_title("Edited frames", fontsize="small")
+        self.ax.set_title(TIMELINE_TITLE, fontsize="small")
         self.figure.tight_layout()
 
     def _apply_theme(self, event=None):
@@ -190,6 +283,8 @@ class EditTimelineWidget(QWidget):
             self.active_layer = None
             self._max_frame = 0
             self._removed_points = []
+            self._interpolated_spans = []
+            self._clear_pending_anchor()
             self._redraw_bars()
 
     def set_show_individuals(self, checked: bool) -> None:
@@ -215,8 +310,44 @@ class EditTimelineWidget(QWidget):
         self._removed_points = self._reconstruct_previously_removed_points(
             layer
         )
+        self._interpolated_spans = []
+        self._clear_pending_anchor()
         self._redraw_bars()
         self._reset_xlim()
+
+    def set_interpolate_mode(self, enabled: bool) -> None:
+        """Switch timeline clicks between jumping and picking anchors.
+
+        Called by the "Interpolate between anchors" button that
+        :class:`~movement.napari.meta_widget.MovementMetaWidget` places
+        in its "Edit tracked data" section. Leaving the mode discards a
+        half-picked (single) anchor.
+        """
+        self._interpolate_mode = enabled
+        self._clear_pending_anchor()
+        self.ax.set_title(
+            INTERPOLATE_TITLE if enabled else TIMELINE_TITLE,
+            fontsize="small",
+        )
+        self.canvas.draw_idle()
+
+    def add_interpolated_span(
+        self, start_frame: int, end_frame: int, individual: str
+    ) -> None:
+        """Mark a run of frames as interpolated for ``individual``.
+
+        Drawn as a dashed line between the two anchor frames, in the
+        individual's lane (or the shared lane) alongside the edited bars.
+        """
+        self._interpolated_spans.append((start_frame, end_frame, individual))
+        self._redraw_bars()
+
+    def _clear_pending_anchor(self) -> None:
+        """Forget a first anchor click and remove its marker line."""
+        self._pending_anchor = None
+        if self._anchor_line is not None:
+            self._anchor_line.remove()
+            self._anchor_line = None
 
     def _on_active_layer_changed(self, event=None):
         """Switch to displaying edited frames for the active Points layer.
@@ -308,10 +439,11 @@ class EditTimelineWidget(QWidget):
 
     def _redraw_bars(self):
         """Redraw the per-individual lanes of edited-frame bars."""
-        for artist in (*self._bars, *self._lane_dividers):
+        for artist in (*self._bars, *self._lane_dividers, *self._span_lines):
             artist.remove()
         self._bars = []
         self._lane_dividers = []
+        self._span_lines = []
         self._edited_frames = np.array([])
 
         if self.active_layer is None:
@@ -390,6 +522,20 @@ class EditTimelineWidget(QWidget):
                     )
                 )
             self._edited_frames = np.unique([p[0] for p in all_points])
+
+        for start, end, individual in self._interpolated_spans:
+            lane = lane_of.get(individual, 0)
+            self._span_lines.append(
+                self.ax.hlines(
+                    (lane + 0.5) * lane_height,
+                    start,
+                    end,
+                    colors=[color_of(individual)],
+                    linestyles="dashed",
+                    linewidth=1.5,
+                    zorder=2,
+                )
+            )
 
         self.figure.tight_layout()
         self._on_step_changed()
@@ -492,22 +638,64 @@ class EditTimelineWidget(QWidget):
     def _handle_click(self, event):
         """Jump the viewer to the edited frame nearest the click.
 
-        Double-clicking resets the timeline to the full frame range.
-        Clicks too far from any edited-frame bar are ignored.
+        In interpolate mode, pick an anchor frame instead (see
+        :meth:`_select_anchor`). Double-clicking resets the timeline
+        to the full frame range (and discards a half-picked anchor).
+        Outside interpolate mode, clicks too far from any edited-frame
+        bar are ignored.
         """
         if event.dblclick:
+            self._clear_pending_anchor()
             self._reset_xlim()
             return
-        if self._edited_frames.size == 0:
-            return
+        nearest_edited = self._nearest_edited_frame(event.xdata)
+        if self._interpolate_mode:
+            frame = (
+                int(nearest_edited)
+                if nearest_edited is not None
+                else int(round(event.xdata))
+            )
+            self._select_anchor(min(max(frame, 0), int(self._max_frame)))
+        elif nearest_edited is not None:
+            current_step = self.viewer.dims.current_step
+            self.viewer.dims.current_step = (
+                int(nearest_edited),
+            ) + current_step[1:]
 
+    def _nearest_edited_frame(self, xdata):
+        """Return the edited frame within click tolerance of ``xdata``.
+
+        A bar is a single vertical line, so a click is rarely
+        pixel-exact; anything within ``CLICK_TOLERANCE_FRACTION`` of the
+        visible range counts as a hit. Returns None if there is no such
+        bar.
+        """
+        if self._edited_frames.size == 0:
+            return None
         nearest = self._edited_frames[
-            np.argmin(np.abs(self._edited_frames - event.xdata))
+            np.argmin(np.abs(self._edited_frames - xdata))
         ]
         xmin, xmax = self.ax.get_xlim()
         tolerance = max(1.0, CLICK_TOLERANCE_FRACTION * (xmax - xmin))
-        if abs(nearest - event.xdata) > tolerance:
-            return
+        return nearest if abs(nearest - xdata) <= tolerance else None
 
-        current_step = self.viewer.dims.current_step
-        self.viewer.dims.current_step = (int(nearest),) + current_step[1:]
+    def _select_anchor(self, frame: int) -> None:
+        """Record an anchor click; emit ``anchors_selected`` on the second.
+
+        The first click is marked with a dotted line until the second
+        click completes the pair. Clicking the same frame twice keeps
+        waiting for a different second anchor.
+        """
+        if self._pending_anchor is None:
+            self._pending_anchor = frame
+            self._anchor_line = self.ax.axvline(
+                frame, color=self._foreground, linestyle=":", zorder=3
+            )
+            self.canvas.draw_idle()
+            return
+        if frame == self._pending_anchor:
+            return
+        start, end = sorted((self._pending_anchor, frame))
+        self._clear_pending_anchor()
+        self.canvas.draw_idle()
+        self.anchors_selected.emit(start, end)

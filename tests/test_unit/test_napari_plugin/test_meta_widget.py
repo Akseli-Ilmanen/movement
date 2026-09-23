@@ -3,7 +3,10 @@
 import numpy as np
 import pytest
 from napari.layers.base import ActionType
+from qtpy.QtWidgets import QMessageBox
 
+from movement.napari.edit_timeline_widget import ALL_KEYPOINTS
+from movement.napari.loader_widgets import DataLoader
 from movement.napari.meta_widget import MovementMetaWidget
 
 
@@ -282,3 +285,137 @@ def test_editing_points_expands_edit_section(
 
     edit()  # A repeat edit should not re-expand the collapsible
     assert expand.call_count == (1 if expect_expanded else 0)
+
+
+# ---- Interpolation between anchors --------------------
+
+
+@pytest.fixture
+def meta_widget_with_data(
+    make_napari_viewer_proxy, valid_poses_path_and_ds, loaded_data_loader
+):
+    """Return a ``MovementMetaWidget`` with a poses dataset loaded through
+    its own loader and its "Edit tracked data" section expanded.
+    """
+    viewer = make_napari_viewer_proxy()
+    meta_widget = MovementMetaWidget(viewer)
+    filepath, ds = valid_poses_path_and_ds
+    loaded_data_loader(filepath, ds, loader=meta_widget.findChild(DataLoader))
+    meta_widget.collapsible_widgets[1].expand(animate=False)
+    return meta_widget
+
+
+def _items(combo):
+    return [combo.itemText(i) for i in range(combo.count())]
+
+
+def test_track_choices_follow_the_loaded_layer(meta_widget_with_data):
+    """Loading data fills the individual/keypoint dropdowns and enables
+    the interpolate button.
+    """
+    controls = meta_widget_with_data.edit_controls
+    assert _items(controls.individual_combo) == ["id_0", "id_1"]
+    assert _items(controls.keypoint_combo) == [
+        ALL_KEYPOINTS,
+        "centroid",
+        "left",
+        "right",
+    ]
+    assert controls.interpolate_button.isEnabled()
+    assert controls.selected_keypoint is None  # "all keypoints" by default
+
+
+def test_interpolate_button_drives_the_timeline_mode(meta_widget_with_data):
+    """Toggling the button switches the timeline's click behaviour."""
+    timeline = meta_widget_with_data.edit_timeline_widget
+    button = meta_widget_with_data.edit_controls.interpolate_button
+
+    button.setChecked(True)
+    assert timeline._interpolate_mode is True
+    button.setChecked(False)
+    assert timeline._interpolate_mode is False
+
+
+@pytest.mark.parametrize(
+    "keypoint, expected_keypoints",
+    [
+        pytest.param("centroid", {"centroid"}, id="single_keypoint"),
+        pytest.param(
+            ALL_KEYPOINTS, {"centroid", "left", "right"}, id="all_keypoints"
+        ),
+    ],
+)
+def test_anchors_selected_interpolates_the_chosen_tracks(
+    meta_widget_with_data, keypoint, expected_keypoints
+):
+    """Picking two anchors interpolates the dropdown-selected track(s)
+    and marks the span on the timeline.
+    """
+    controls = meta_widget_with_data.edit_controls
+    timeline = meta_widget_with_data.edit_timeline_widget
+    layer = timeline.active_layer
+    controls.individual_combo.setCurrentText("id_1")
+    controls.keypoint_combo.setCurrentText(keypoint)
+
+    timeline.anchors_selected.emit(2, 6)
+
+    edited = layer.properties["edited"]
+    assert set(layer.properties["keypoint"][edited]) == expected_keypoints
+    assert set(layer.properties["individual"][edited]) == {"id_1"}
+    assert sorted(set(layer.data[edited, 0])) == [3, 4, 5]
+    assert timeline._interpolated_spans == [(2, 6, "id_1")]
+
+
+@pytest.mark.parametrize("confirmed", [True, False])
+def test_overwriting_edited_points_asks_first(
+    meta_widget_with_data, move_point, mocker, confirmed
+):
+    """Points already edited between the anchors are only overwritten
+    after the user agrees.
+    """
+    controls = meta_widget_with_data.edit_controls
+    timeline = meta_widget_with_data.edit_timeline_widget
+    loader = meta_widget_with_data.findChild(DataLoader)
+    move_point(loader, 4, "centroid", "id_0", new_y=100, new_x=200)
+    controls.individual_combo.setCurrentText("id_0")
+    controls.keypoint_combo.setCurrentText("centroid")
+    answer = QMessageBox.StandardButton.Yes
+    if not confirmed:
+        answer = QMessageBox.StandardButton.No
+    question = mocker.patch.object(
+        QMessageBox, "question", return_value=answer
+    )
+
+    timeline.anchors_selected.emit(2, 6)
+
+    question.assert_called_once()
+    layer = timeline.active_layer
+    edited_frames = sorted(set(layer.data[layer.properties["edited"], 0]))
+    assert edited_frames == ([3, 4, 5] if confirmed else [4])
+
+
+def test_anchors_without_points_are_reported(
+    meta_widget_with_data, remove_point, mocker
+):
+    """A track lacking a point at an anchor is skipped with a warning,
+    while the other tracks are still interpolated.
+    """
+    controls = meta_widget_with_data.edit_controls
+    timeline = meta_widget_with_data.edit_timeline_widget
+    loader = meta_widget_with_data.findChild(DataLoader)
+    remove_point(loader, 2, "left", "id_0")
+    controls.individual_combo.setCurrentText("id_0")
+    controls.keypoint_combo.setCurrentText(ALL_KEYPOINTS)
+    show_warning = mocker.patch("movement.napari.meta_widget.show_warning")
+
+    timeline.anchors_selected.emit(2, 6)
+
+    show_warning.assert_called_once()
+    assert "'left'" in show_warning.call_args.args[0]
+    layer = timeline.active_layer
+    edited = layer.properties["edited"]
+    in_between = (layer.data[:, 0] > 2) & (layer.data[:, 0] < 6)
+    assert set(layer.properties["keypoint"][edited & in_between]) == {
+        "centroid",
+        "right",
+    }

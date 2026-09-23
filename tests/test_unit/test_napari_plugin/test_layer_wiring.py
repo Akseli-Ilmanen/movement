@@ -16,8 +16,10 @@ from napari.components.dims import RangeTuple
 from napari.layers.base import ActionType
 
 from movement.napari.layer_wiring import (
+    INTERPOLATION_METHODS,
     MAX_FRAME_IDX_KEY,
     connect_viewer_callbacks,
+    interpolate_track_between,
     update_frame_slider_range,
 )
 from movement.napari.loader_widgets import DataLoader
@@ -373,3 +375,105 @@ def test_frame_slider_range_ignores_row_count(headless_napari_viewer, rng):
     assert headless_napari_viewer.dims.range[0] == RangeTuple(
         0.0, N_FRAMES - 1, 1.0
     )
+
+
+# ---- Interpolation between anchor frames --------------------
+
+
+@pytest.fixture
+def loader_with_corrected_anchors(
+    valid_poses_path_and_ds, loaded_data_loader, move_point
+):
+    """Return a loaded ``DataLoader`` with the ``id_0`` centroid dragged
+    to known positions on frames 2 and 6, ready to interpolate between.
+    """
+    loader = loaded_data_loader(*valid_poses_path_and_ds)
+    move_point(loader, 2, "centroid", "id_0", new_y=0, new_x=0)
+    move_point(loader, 6, "centroid", "id_0", new_y=40, new_x=80)
+    return loader
+
+
+@pytest.mark.parametrize("method", INTERPOLATION_METHODS)
+def test_interpolate_track_between_moves_only_points_in_between(
+    loader_with_corrected_anchors, method
+):
+    """Only the track's points strictly between the anchors move.
+
+    Moved points are flagged as edited with NaN confidence, and the
+    Tracks layer follows them, exactly as after a drag.
+    """
+    layer = loader_with_corrected_anchors.points_layer
+    tracks_layer = loader_with_corrected_anchors.tracks_layer
+    data_before = layer.data.copy()
+
+    moved = interpolate_track_between(layer, "id_0", "centroid", 2, 6, method)
+
+    frames = layer.data[moved, 0]
+    assert sorted(frames) == [3, 4, 5]
+    assert set(layer.properties["keypoint"][moved]) == {"centroid"}
+    assert set(layer.properties["individual"][moved]) == {"id_0"}
+    untouched = np.setdiff1d(np.arange(len(layer.data)), moved)
+    np.testing.assert_array_equal(
+        layer.data[untouched], data_before[untouched]
+    )
+    assert layer.properties["edited"][moved].all()
+    assert np.isnan(layer.properties["confidence"][moved]).all()
+    np.testing.assert_array_equal(
+        tracks_layer.data[moved, 1:], layer.data[moved]
+    )
+    if method == "linear":
+        # Anchors at (y, x) = (0, 0) on frame 2 and (40, 80) on frame 6
+        expected = np.column_stack(((frames - 2) * 10, (frames - 2) * 20))
+        np.testing.assert_allclose(layer.data[moved, 1:], expected)
+    elif method == "nearest":
+        by_frame = dict(zip(frames, layer.data[moved, 1:], strict=True))
+        np.testing.assert_allclose(by_frame[3], [0, 0])
+        np.testing.assert_allclose(by_frame[5], [40, 80])
+
+
+def test_interpolate_track_between_skips_missing_frames(
+    valid_poses_path_and_ds_with_localised_nans, loaded_data_loader
+):
+    """A frame with no point (NaN in the source data) is not filled in."""
+    filepath, ds = valid_poses_path_and_ds_with_localised_nans(
+        {"time": "middle", "individual": "id_0", "keypoint": "centroid"}
+    )  # NaN on frame 5
+    layer = loaded_data_loader(filepath, ds).points_layer
+
+    moved = interpolate_track_between(layer, "id_0", "centroid", 2, 8)
+
+    assert sorted(layer.data[moved, 0]) == [3, 4, 6, 7]
+
+
+def test_interpolate_track_between_requires_points_at_both_anchors(
+    valid_poses_path_and_ds_with_localised_nans, loaded_data_loader
+):
+    """An anchor frame without a point for the track is an error."""
+    filepath, ds = valid_poses_path_and_ds_with_localised_nans(
+        {"time": "middle", "individual": "id_0", "keypoint": "centroid"}
+    )  # NaN on frame 5
+    layer = loaded_data_loader(filepath, ds).points_layer
+
+    with pytest.raises(ValueError, match="no point at anchor frame 5"):
+        interpolate_track_between(layer, "id_0", "centroid", 5, 8)
+
+
+def test_interpolate_track_between_rejects_reversed_anchors(
+    loader_with_corrected_anchors,
+):
+    """``start_frame`` must come before ``end_frame``."""
+    layer = loader_with_corrected_anchors.points_layer
+    with pytest.raises(ValueError, match="smaller than"):
+        interpolate_track_between(layer, "id_0", "centroid", 6, 2)
+
+
+def test_interpolate_track_between_with_too_few_points_for_method(
+    make_napari_viewer_proxy,
+):
+    """A cubic fit needs more support points than two anchors."""
+    layer = make_napari_viewer_proxy().add_points(
+        np.array([[0, 0, 0], [1, 5, 5], [2, 10, 10]]),
+        properties={"individual": ["a"] * 3, "keypoint": ["k"] * 3},
+    )
+    with pytest.raises(ValueError, match="method 'cubic'"):
+        interpolate_track_between(layer, "a", "k", 0, 2, method="cubic")
