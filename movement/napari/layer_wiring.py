@@ -105,6 +105,20 @@ def track_row_indices(
     return np.flatnonzero(mask)
 
 
+def edited_frames(
+    layer: Points, individual: str, keypoint: str | None = None
+) -> np.ndarray:
+    """Return the sorted frames on which a track's point was edited.
+
+    See :func:`track_row_indices` for what makes up a track.
+    """
+    edited = layer.properties.get("edited")
+    if edited is None:
+        return np.array([], dtype=int)
+    rows = track_row_indices(layer, individual, keypoint)
+    return np.sort(layer.data[rows[edited[rows]], 0]).astype(int)
+
+
 # ---- Callbacks with viewer lifetime --------------------
 def connect_viewer_callbacks(viewer) -> None:
     """Wire the layer callbacks to a viewer, skipping if already wired.

@@ -70,6 +70,8 @@ class EditControlsWidget(QWidget):
 
     show_individuals_toggled = Signal(bool)
     interpolate_mode_toggled = Signal(bool)
+    interpolate_all_clicked = Signal()
+    undo_clicked = Signal()
 
     def __init__(self, parent=None):
         """Initialise the instructions label and the edit controls."""
@@ -81,7 +83,12 @@ class EditControlsWidget(QWidget):
             "To fix a run of misplaced frames, correct the frame before and "
             "the frame after the run, then press 'Interpolate between "
             "anchors' and click those two frames on the timeline. The "
-            "points in between are re-positioned by interpolation."
+            "points in between are re-positioned by interpolation.\n\n"
+            "Alternatively, correct several frames and press 'Interpolate "
+            "between all edited points' to re-position the points between "
+            "each edited frame and the next.\n\n"
+            "'Undo last edit' puts back the points moved by the last drag "
+            "or interpolation."
         )
         instructions.setWordWrap(True)
 
@@ -116,12 +123,36 @@ class EditControlsWidget(QWidget):
         self.interpolate_button.setCheckable(True)
         self.interpolate_button.setEnabled(False)  # until data is loaded
         self.interpolate_button.toggled.connect(self.interpolate_mode_toggled)
+        self.interpolate_all_button = QPushButton(
+            "Interpolate between all edited points"
+        )
+        self.interpolate_all_button.setObjectName("interpolate_all_button")
+        self.interpolate_all_button.setToolTip(
+            "Use every edited point of the chosen keypoint(s) as an\n"
+            "anchor, and interpolate between each anchor and the next."
+        )
+        self.interpolate_all_button.setEnabled(False)  # until data is loaded
+        self.interpolate_all_button.clicked.connect(
+            self.interpolate_all_clicked
+        )
 
         interpolate_form = QFormLayout()
         interpolate_form.addRow("individual:", self.individual_combo)
         interpolate_form.addRow("keypoint:", self.keypoint_combo)
         interpolate_form.addRow("method:", self.method_combo)
         interpolate_form.addRow(self.interpolate_button)
+        interpolate_form.addRow(self.interpolate_all_button)
+
+        self.undo_button = QPushButton("Undo last edit")
+        self.undo_button.setObjectName("undo_button")
+        self.undo_button.setToolTip(
+            "Put the points moved by the last drag or interpolation back\n"
+            "where they were. Press again to undo the edit before that.\n"
+            "Deleting a point cannot be undone, and clears this history."
+        )
+        self.undo_button.setEnabled(False)  # until a point is moved
+        self.undo_button.clicked.connect(self.undo_clicked)
+        interpolate_form.addRow(self.undo_button)
 
         layout = QVBoxLayout()
         layout.addWidget(instructions)
@@ -154,6 +185,7 @@ class EditControlsWidget(QWidget):
                 combo.setCurrentText(current)
         self.keypoint_combo.setEnabled(keypoints is not None)
         self.interpolate_button.setEnabled(bool(individuals))
+        self.interpolate_all_button.setEnabled(bool(individuals))
 
     @property
     def selected_keypoint(self) -> str | None:
@@ -348,6 +380,16 @@ class EditTimelineWidget(QWidget):
         individual's lane (or the shared lane) alongside the edited bars.
         """
         self._interpolated_spans.append((start_frame, end_frame, individual))
+        self._redraw_bars()
+
+    def remove_last_interpolated_spans(self, n_spans: int) -> None:
+        """Remove the ``n_spans`` most recently added interpolated spans."""
+        if n_spans > 0:
+            del self._interpolated_spans[-n_spans:]
+        self._redraw_bars()
+
+    def refresh(self) -> None:
+        """Redraw the timeline from the current state of the layer."""
         self._redraw_bars()
 
     def _clear_pending_anchor(self) -> None:

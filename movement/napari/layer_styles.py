@@ -9,6 +9,7 @@ from napari.utils.color import ColorValue
 from napari.utils.colormaps import ensure_colormap
 
 DEFAULT_COLORMAP = "turbo"
+DEFAULT_POINT_SYMBOL = "disc"
 EDITED_POINT_SYMBOL = "ring"
 
 
@@ -29,7 +30,7 @@ class LayerStyle:
 class PointsStyle(LayerStyle):
     """Style properties for a napari Points layer."""
 
-    symbol: str = "disc"
+    symbol: str = DEFAULT_POINT_SYMBOL
     size: int = 10
     border_width: int = 0
     face_color: str | None = None

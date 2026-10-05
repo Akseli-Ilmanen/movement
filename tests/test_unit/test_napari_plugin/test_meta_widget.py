@@ -5,6 +5,8 @@ import pytest
 from napari.layers.base import ActionType
 from qtpy.QtWidgets import QMessageBox
 
+from movement.io import save_poses
+from movement.napari.batch_widget import BatchLoader
 from movement.napari.edit_timeline_widget import ALL_KEYPOINTS
 from movement.napari.loader_widgets import DataLoader
 from movement.napari.meta_widget import MovementMetaWidget
@@ -459,3 +461,254 @@ def test_optical_flow_method_follows_the_video_layer(meta_widget_with_data):
     assert set(layer.properties["keypoint"][edited]) == {"centroid"}
     assert sorted(layer.data[edited, 0]) == [3, 4, 5]
     assert timeline._interpolated_spans == [(2, 6, "id_1")]
+
+
+# ---- Interpolation between all edited points --------------------
+
+
+def _drag_point(layer, frame, keypoint, individual, new_y, new_x):
+    """Simulate the user dragging one point of a Points layer."""
+    props = layer.properties
+    idx = int(
+        np.flatnonzero(
+            (layer.data[:, 0] == frame)
+            & (props["keypoint"] == keypoint)
+            & (props["individual"] == individual)
+        )[0]
+    )
+    layer.data[idx, 1:] = (new_y, new_x)
+    layer.events.data(
+        value=layer.data,
+        action=ActionType.CHANGED,
+        data_indices=(idx,),
+        vertex_indices=((),),
+    )
+    return idx
+
+
+def test_interpolate_all_uses_every_edited_point_as_anchor(
+    meta_widget_with_data,
+):
+    """The points between each edited point and the next are interpolated
+    for the chosen keypoint, leaving the edited points and the other
+    keypoints where they are.
+    """
+    controls = meta_widget_with_data.edit_controls
+    timeline = meta_widget_with_data.edit_timeline_widget
+    layer = timeline.active_layer
+    data_before = layer.data.copy()
+    anchors = {1: (0.0, 0.0), 4: (30.0, 60.0), 8: (10.0, 20.0)}
+    for frame, (y, x) in anchors.items():
+        _drag_point(layer, frame, "centroid", "id_1", y, x)
+    controls.individual_combo.setCurrentText("id_1")
+    controls.keypoint_combo.setCurrentText("centroid")
+
+    controls.interpolate_all_button.click()
+
+    props = layer.properties
+    track = (props["individual"] == "id_1") & (props["keypoint"] == "centroid")
+    frames = layer.data[track, 0]
+    expected = np.column_stack(
+        [
+            np.interp(
+                frames, list(anchors), [yx[i] for yx in anchors.values()]
+            )
+            for i in range(2)
+        ]
+    )
+    in_range = (frames >= 1) & (frames <= 8)
+    np.testing.assert_allclose(
+        layer.data[track, 1:][in_range], expected[in_range]
+    )
+    # Points outside the anchors, and other tracks, are untouched
+    np.testing.assert_array_equal(
+        layer.data[track][~in_range], data_before[track][~in_range]
+    )
+    np.testing.assert_array_equal(layer.data[~track], data_before[~track])
+    assert timeline._interpolated_spans == [(1, 4, "id_1"), (4, 8, "id_1")]
+
+
+def test_interpolate_all_treats_each_keypoint_separately(
+    meta_widget_with_data,
+):
+    """With all keypoints chosen, each keypoint is interpolated between
+    its own edited points only.
+    """
+    controls = meta_widget_with_data.edit_controls
+    layer = meta_widget_with_data.edit_timeline_widget.active_layer
+    for frame in (1, 4):
+        _drag_point(layer, frame, "centroid", "id_1", frame, frame)
+    for frame in (5, 8):
+        _drag_point(layer, frame, "left", "id_1", frame, frame)
+    controls.individual_combo.setCurrentText("id_1")
+    controls.keypoint_combo.setCurrentText(ALL_KEYPOINTS)
+
+    controls.interpolate_all_button.click()
+
+    props = layer.properties
+    edited = props["edited"]
+    for keypoint, expected_frames in (
+        ("centroid", [1, 2, 3, 4]),
+        ("left", [5, 6, 7, 8]),
+    ):
+        frames = layer.data[edited & (props["keypoint"] == keypoint), 0]
+        assert sorted(frames) == expected_frames
+    assert set(props["keypoint"][edited]) == {"centroid", "left"}
+
+
+def test_interpolate_all_without_anchors_warns(meta_widget_with_data, mocker):
+    """With fewer than two edited points there is nothing to interpolate."""
+    controls = meta_widget_with_data.edit_controls
+    layer = meta_widget_with_data.edit_timeline_widget.active_layer
+    _drag_point(layer, 3, "centroid", "id_1", 1.0, 1.0)
+    data_before = layer.data.copy()
+    controls.individual_combo.setCurrentText("id_1")
+    mock_warning = mocker.patch("movement.napari.meta_widget.show_warning")
+
+    controls.interpolate_all_button.click()
+
+    assert "Nothing to interpolate" in mock_warning.call_args.args[0]
+    np.testing.assert_array_equal(layer.data, data_before)
+
+
+# ---- Stepping through a folder of files --------------------
+
+
+def test_edit_section_stays_open_when_stepping_through_folder(
+    make_napari_viewer_proxy, valid_poses_dataset, tmp_path
+):
+    """Loading the next file of a folder keeps the edit section and its
+    timeline open, with the timeline following the new Points layer.
+    """
+    for file_name in ("clip_0.csv", "clip_1.csv"):
+        save_poses.to_dlc_file(
+            valid_poses_dataset, tmp_path / file_name, split_individuals=False
+        )
+    viewer = make_napari_viewer_proxy()
+    meta_widget = MovementMetaWidget(viewer)
+    batch_loader = meta_widget.findChild(BatchLoader)
+    batch_loader.loader.source_software_combo.setCurrentText("DeepLabCut")
+    batch_loader.file_suffix_combo.setCurrentText("csv")
+    batch_loader.folder_path_edit.setText(str(tmp_path))
+    batch_loader._on_load_folder_clicked()
+    edit_timeline_collapsible = meta_widget.collapsible_widgets[2]
+    edit_timeline_collapsible.expand(animate=False)
+
+    batch_loader.next_button.click()
+
+    assert edit_timeline_collapsible.isExpanded()
+    assert not meta_widget._edit_timeline_dock_widget.isHidden()
+    timeline = meta_widget.edit_timeline_widget
+    assert timeline.active_layer.name == "points: clip_1.csv"
+
+
+# ---- Undoing edits --------------------
+
+
+def test_undo_restores_a_dragged_point(meta_widget_with_data):
+    """Undoing a drag puts the point back, with its confidence, edited
+    flag and symbol as before, and keeps the Tracks layer in sync.
+    """
+    controls = meta_widget_with_data.edit_controls
+    layer = meta_widget_with_data.edit_timeline_widget.active_layer
+    tracks_layer = meta_widget_with_data.findChild(DataLoader).tracks_layer
+    data_before = layer.data.copy()
+    confidence_before = layer.properties["confidence"].copy()
+    symbols_before = [str(symbol) for symbol in layer.symbol]
+    assert not controls.undo_button.isEnabled()
+
+    idx = _drag_point(layer, 3, "centroid", "id_1", 100.0, 200.0)
+    assert controls.undo_button.isEnabled()
+    assert layer.properties["edited"][idx]
+
+    controls.undo_button.click()
+
+    np.testing.assert_array_equal(layer.data, data_before)
+    np.testing.assert_array_equal(
+        layer.properties["confidence"], confidence_before
+    )
+    assert not layer.properties["edited"].any()
+    assert [str(symbol) for symbol in layer.symbol] == symbols_before
+    np.testing.assert_array_equal(tracks_layer.data[:, 1:], layer.data)
+    assert not controls.undo_button.isEnabled()
+
+
+def test_undo_reverts_an_interpolation_then_its_anchors(
+    meta_widget_with_data,
+):
+    """An interpolation over several keypoints is undone in one go,
+    leaving the anchors, which are then undone one by one.
+    """
+    controls = meta_widget_with_data.edit_controls
+    timeline = meta_widget_with_data.edit_timeline_widget
+    layer = timeline.active_layer
+    data_before = layer.data.copy()
+    _drag_point(layer, 2, "centroid", "id_1", 0.0, 0.0)
+    _drag_point(layer, 6, "centroid", "id_1", 40.0, 80.0)
+    data_with_anchors = layer.data.copy()
+    controls.individual_combo.setCurrentText("id_1")
+    controls.keypoint_combo.setCurrentText(ALL_KEYPOINTS)
+    timeline.anchors_selected.emit(2, 6)
+    assert timeline._interpolated_spans == [(2, 6, "id_1")]
+
+    controls.undo_button.click()
+
+    np.testing.assert_array_equal(layer.data, data_with_anchors)
+    assert sorted(layer.data[layer.properties["edited"], 0]) == [2, 6]
+    assert timeline._interpolated_spans == []
+
+    controls.undo_button.click()
+    controls.undo_button.click()
+
+    np.testing.assert_array_equal(layer.data, data_before)
+    assert not controls.undo_button.isEnabled()
+
+
+def test_undo_reverts_interpolation_between_all_edited_points(
+    meta_widget_with_data,
+):
+    """All the stretches filled by one press of the button are undone
+    together, along with their spans on the timeline.
+    """
+    controls = meta_widget_with_data.edit_controls
+    timeline = meta_widget_with_data.edit_timeline_widget
+    layer = timeline.active_layer
+    for frame in (1, 4, 8):
+        _drag_point(layer, frame, "centroid", "id_1", frame, frame)
+    data_with_anchors = layer.data.copy()
+    controls.individual_combo.setCurrentText("id_1")
+    controls.keypoint_combo.setCurrentText("centroid")
+    controls.interpolate_all_button.click()
+    assert len(timeline._interpolated_spans) == 2
+
+    controls.undo_button.click()
+
+    np.testing.assert_array_equal(layer.data, data_with_anchors)
+    assert sorted(layer.data[layer.properties["edited"], 0]) == [1, 4, 8]
+    assert timeline._interpolated_spans == []
+
+
+def test_removing_a_point_clears_the_undo_history(meta_widget_with_data):
+    """Moves made before a point is deleted can no longer be undone."""
+    controls = meta_widget_with_data.edit_controls
+    layer = meta_widget_with_data.edit_timeline_widget.active_layer
+    _drag_point(layer, 3, "centroid", "id_1", 100.0, 200.0)
+    assert controls.undo_button.isEnabled()
+
+    layer.selected_data = {0}
+    layer.remove_selected()
+
+    assert not controls.undo_button.isEnabled()
+
+
+def test_undo_history_is_dropped_with_its_layer(meta_widget_with_data):
+    """Removing a layer forgets its history and disables the button."""
+    controls = meta_widget_with_data.edit_controls
+    viewer = meta_widget_with_data._viewer
+    layer = meta_widget_with_data.edit_timeline_widget.active_layer
+    _drag_point(layer, 3, "centroid", "id_1", 100.0, 200.0)
+
+    viewer.layers.clear()
+
+    assert meta_widget_with_data._edit_histories == {}
+    assert not controls.undo_button.isEnabled()

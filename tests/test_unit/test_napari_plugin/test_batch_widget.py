@@ -9,7 +9,9 @@ from napari.layers.base import ActionType
 from movement.io import save_poses
 from movement.napari.batch_widget import (
     EDITED_FILE_SUFFIX,
+    NEXT_FILE_SHORTCUT,
     NO_FOLDER_STATUS,
+    PREVIOUS_FILE_SHORTCUT,
     BatchLoader,
     match_video,
 )
@@ -260,6 +262,12 @@ def test_failed_load_is_reported(batch_loader_with_folder, mocker):
             "clip-1DLC_resnet50_shuffle1.h5", "clip-1.mp4", id="name_prefix"
         ),
         pytest.param("clip-10.h5", "clip-10.mp4", id="longest_prefix"),
+        pytest.param(
+            "Clip_-1DLC_resnet50.h5", "clip-1.mp4", id="other_separators"
+        ),
+        pytest.param(
+            "clip_-10DLC_resnet50.h5", "clip-10.mp4", id="longest_loose"
+        ),
         pytest.param("other.h5", None, id="no_match"),
     ],
 )
@@ -356,3 +364,89 @@ def test_points_only_skips_tracks_layer(batch_loader, poses_folder):
 
     assert (poses_folder / f"clip_0{EDITED_FILE_SUFFIX}").exists()
     assert [type(ly) for ly in batch_loader.viewer.layers] == [Points]
+
+
+def test_loaded_points_layer_is_in_select_mode(batch_loader_with_folder):
+    """Test that each file's Points layer is ready for selecting points."""
+    batch_loader = batch_loader_with_folder
+    assert _points_layer(batch_loader).mode == "select"
+
+    batch_loader.next_button.click()
+
+    assert _points_layer(batch_loader).mode == "select"
+
+
+def test_keyboard_shortcuts_step_through_files(batch_loader_with_folder):
+    """Test that the viewer's shortcuts load the next and previous file,
+    and are released when the widget is closed.
+    """
+    batch_loader = batch_loader_with_folder
+    viewer = batch_loader.viewer
+    keymap = {str(key): func for key, func in viewer.keymap.items()}
+
+    keymap[NEXT_FILE_SHORTCUT](viewer)
+    assert batch_loader.index == 1
+
+    keymap[PREVIOUS_FILE_SHORTCUT.replace("-", "+")](viewer)
+    assert batch_loader.index == 0
+
+    batch_loader.close()
+    assert not viewer.keymap
+
+
+def test_subfolders_are_queued_with_their_own_videos(
+    batch_loader, valid_poses_dataset, tmp_path, mocker
+):
+    """Test that the files in subfolders are queued in order, each
+    matched to the video in its own subfolder even if a video of the
+    same name exists elsewhere.
+    """
+    folder = tmp_path / "sessions"
+    for session in ("session_1", "session_2"):
+        (folder / session).mkdir(parents=True)
+        save_poses.to_dlc_file(
+            valid_poses_dataset,
+            folder / session / "clipDLC.csv",
+            split_individuals=False,
+        )
+        (folder / session / "clip.mp4").touch()
+    (folder / "session_2" / "other.csv").write_text("")
+    (folder / "session_2" / "other.csv").rename(
+        folder / "session_2" / f"clip{EDITED_FILE_SUFFIX}"
+    )
+    mock_open_video = mocker.patch.object(batch_loader, "_open_video")
+    batch_loader.folder_path_edit.setText(str(folder))
+
+    batch_loader._on_load_folder_clicked()
+
+    assert batch_loader.status_label.text() == "1/2: session_1/clipDLC.csv"
+    assert batch_loader.videos == [
+        folder / "session_1" / "clip.mp4",
+        folder / "session_2" / "clip.mp4",
+    ]
+
+    _drag_first_point(batch_loader)
+    batch_loader.next_button.click()
+
+    assert batch_loader.status_label.text() == "2/2: session_2/clipDLC.csv"
+    assert (folder / "session_1" / f"clipDLC{EDITED_FILE_SUFFIX}").exists()
+    assert mock_open_video.call_args.args[0] == (
+        folder / "session_2" / "clip.mp4"
+    )
+
+
+def test_video_in_another_subfolder_is_used_as_fallback(
+    batch_loader, poses_folder, tmp_path
+):
+    """Test that a video is still found if the video folder is not
+    organised in the same subfolders as the files.
+    """
+    video_folder = tmp_path / "videos"
+    (video_folder / "elsewhere").mkdir(parents=True)
+    (video_folder / "elsewhere" / "clip_1.mp4").touch()
+    batch_loader.folder = poses_folder
+    batch_loader.files = sorted(poses_folder.glob("*.csv"))
+
+    videos = batch_loader._match_videos(video_folder)
+
+    assert videos == [None, video_folder / "elsewhere" / "clip_1.mp4", None]
