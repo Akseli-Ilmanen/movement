@@ -68,6 +68,9 @@ class DataLoader(QWidget):
         """Initialize the data loader widget."""
         super().__init__(parent=parent)
         self.viewer = napari_viewer
+        # Whether to add a Tracks layer alongside the Points layer on load.
+        # Tracks are not needed for editing points, so they can be skipped.
+        self.add_tracks: bool = True
         self.setLayout(QFormLayout())
 
         # Create widgets
@@ -211,7 +214,8 @@ class DataLoader(QWidget):
         # Add the data as a points and a tracks layers,
         # and a boxes layer if the dataset is a bounding boxes one
         self._add_points_layer()
-        self._add_tracks_layer()
+        if self.add_tracks:
+            self._add_tracks_layer()
         if self.data_bboxes is not None:
             self._add_boxes_layer()
 

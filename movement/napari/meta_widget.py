@@ -13,6 +13,7 @@ from qtpy.QtWidgets import QMessageBox
 if TYPE_CHECKING:
     from qtpy.QtWidgets import QWidget
 
+from movement.napari.batch_widget import BatchLoader
 from movement.napari.edit_timeline_widget import (
     EditControlsWidget,
     EditTimelineWidget,
@@ -43,10 +44,19 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
         self._edit_timeline_dock_widget: QWidget | None = None
 
         # Add the data loader widget
+        data_loader = DataLoader(napari_viewer, parent=self)
         self.add_widget(
-            DataLoader(napari_viewer, parent=self),
+            data_loader,
             collapsible=True,
             widget_title="Load tracked data",
+        )
+
+        # Add the batch loader widget, which steps through the files
+        # of a folder using the settings of the data loader widget
+        self.add_widget(
+            BatchLoader(napari_viewer, data_loader, parent=self),
+            collapsible=True,
+            widget_title="Load folder of tracked data",
         )
 
         # A collapsible "edit controls" widget that can be used

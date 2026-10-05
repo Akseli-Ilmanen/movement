@@ -234,7 +234,9 @@ def sync_tracks_layer(points_layer, moved_indices):
     in the Tracks layer, so the track segment connecting the
     previous frame to this one terminates at the dragged position.
     """
-    tracks_layer = points_layer.metadata[TRACKS_LAYER_KEY]
+    tracks_layer = points_layer.metadata.get(TRACKS_LAYER_KEY)
+    if tracks_layer is None:
+        return  # the data was loaded without a Tracks layer
 
     # Points and Tracks layers are built from the same NaN-filtered
     # array in the same row order (see _add_points_layer/
@@ -258,7 +260,9 @@ def remove_from_tracks_layer(points_layer, removed_indices):
     up with rows in the Tracks layer, the same way
     :func:`sync_tracks_layer` relies on for edits.
     """
-    tracks_layer = points_layer.metadata[TRACKS_LAYER_KEY]
+    tracks_layer = points_layer.metadata.get(TRACKS_LAYER_KEY)
+    if tracks_layer is None:
+        return  # the data was loaded without a Tracks layer
 
     tracks_data = np.delete(tracks_layer.data, removed_indices, axis=0)
     tracks_properties = {

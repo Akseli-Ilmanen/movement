@@ -1,5 +1,7 @@
 """Widget for saving movement datasets from napari layers."""
 
+from pathlib import Path
+
 from napari.layers import Points
 from napari.utils.notifications import show_error, show_info
 from napari.viewer import Viewer
@@ -19,6 +21,40 @@ DISABLED_TOOLTIP = "Select a points layer containing tracked data"
 ENABLED_TOOLTIP = (
     "Save currently selected points layer to a movement (netCDF) file"
 )
+
+
+def save_points_layer(layer: Points, file_path: Path | str) -> Path:
+    """Save a movement Points layer as a movement (netCDF) file.
+
+    The dataset is reconstructed from the layer's data, properties
+    and metadata, and written to ``file_path`` (overwriting it if it
+    already exists).
+
+    Parameters
+    ----------
+    layer
+        A movement Points layer.
+    file_path
+        Path to the netCDF (.nc) file to write.
+
+    Returns
+    -------
+    Path
+        The validated path the dataset was saved to.
+
+    """
+    valid_path = validate_file_path(
+        file_path, permission="w", suffixes={".nc"}
+    )
+    ds = napari_layers_to_ds(
+        points_as_napari=layer.data,
+        properties=layer.properties,
+        properties_with_nans=layer.metadata[POINTS_PROPERTIES_KEY],
+        attrs=layer.metadata[DATASET_ATTRS_KEY],
+    )
+    save_dataset(ds, valid_path)
+    logger.info(f"Saved dataset to '{valid_path}'.")
+    return valid_path
 
 
 class DataSaver(QWidget):
@@ -83,21 +119,11 @@ class DataSaver(QWidget):
             file_path += ".nc"
 
         try:
-            valid_path = validate_file_path(
-                file_path, permission="w", suffixes={".nc"}
-            )
-            ds = napari_layers_to_ds(
-                points_as_napari=layer.data,
-                properties=layer.properties,
-                properties_with_nans=layer.metadata[POINTS_PROPERTIES_KEY],
-                attrs=layer.metadata[DATASET_ATTRS_KEY],
-            )
-            save_dataset(ds, valid_path)
+            valid_path = save_points_layer(layer, file_path)
         except Exception as e:
             show_error(f"Failed to save dataset to '{file_path}': {e}")
             return
 
-        logger.info(f"Saved dataset to '{valid_path}'.")
         show_info(f"Saved dataset to '{valid_path}'.")
 
     def _is_valid_points_layer(self, layer) -> bool:
