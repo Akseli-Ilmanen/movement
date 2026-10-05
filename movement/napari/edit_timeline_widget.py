@@ -29,6 +29,7 @@ from qtpy.QtWidgets import (
 from movement.napari.layer_wiring import (
     INTERPOLATION_METHODS,
     MAX_FRAME_IDX_KEY,
+    OPTICAL_FLOW_METHOD,
     POINTS_PROPERTIES_KEY,
     active_movement_points_layer,
     is_movement_points_layer,
@@ -102,7 +103,14 @@ class EditControlsWidget(QWidget):
         self.keypoint_combo.setObjectName("keypoint_combo")
         self.method_combo = QComboBox()
         self.method_combo.setObjectName("method_combo")
-        self.method_combo.addItems(INTERPOLATION_METHODS)
+        self.method_combo.addItems(
+            [*INTERPOLATION_METHODS, OPTICAL_FLOW_METHOD]
+        )
+        self.method_combo.setToolTip(
+            f"'{OPTICAL_FLOW_METHOD}' follows the image content of the\n"
+            "loaded video between the anchors (Lucas-Kanade tracking).\n"
+            "The other methods only use the positions of the points."
+        )
         self.interpolate_button = QPushButton("Interpolate between anchors")
         self.interpolate_button.setObjectName("interpolate_button")
         self.interpolate_button.setCheckable(True)

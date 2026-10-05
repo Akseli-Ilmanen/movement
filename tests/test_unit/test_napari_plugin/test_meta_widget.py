@@ -419,3 +419,43 @@ def test_anchors_without_points_are_reported(
         "centroid",
         "right",
     }
+
+
+def test_optical_flow_method_needs_a_video(meta_widget_with_data, mocker):
+    """Without a video layer, the optical flow method warns and moves
+    nothing.
+    """
+    controls = meta_widget_with_data.edit_controls
+    timeline = meta_widget_with_data.edit_timeline_widget
+    controls.method_combo.setCurrentText("optical flow")
+    mock_warning = mocker.patch("movement.napari.meta_widget.show_warning")
+
+    timeline.anchors_selected.emit(2, 6)
+
+    assert "load the video first" in mock_warning.call_args.args[0]
+    assert "edited" not in timeline.active_layer.properties
+    assert timeline._interpolated_spans == []
+
+
+def test_optical_flow_method_follows_the_video_layer(meta_widget_with_data):
+    """With a video layer loaded, the optical flow method moves the
+    points between the anchors and marks the span on the timeline.
+    """
+    controls = meta_widget_with_data.edit_controls
+    timeline = meta_widget_with_data.edit_timeline_widget
+    layer = timeline.active_layer
+    video = np.random.default_rng(0).integers(
+        0, 255, size=(10, 256, 256), dtype=np.uint8
+    )
+    meta_widget_with_data._viewer.add_image(video, name="video")
+    meta_widget_with_data._viewer.layers.selection.active = layer
+    controls.individual_combo.setCurrentText("id_1")
+    controls.keypoint_combo.setCurrentText("centroid")
+    controls.method_combo.setCurrentText("optical flow")
+
+    timeline.anchors_selected.emit(2, 6)
+
+    edited = layer.properties["edited"]
+    assert set(layer.properties["keypoint"][edited]) == {"centroid"}
+    assert sorted(layer.data[edited, 0]) == [3, 4, 5]
+    assert timeline._interpolated_spans == [(2, 6, "id_1")]

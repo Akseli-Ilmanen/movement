@@ -18,8 +18,13 @@ from napari.layers.base import ActionType
 from movement.napari.layer_wiring import (
     INTERPOLATION_METHODS,
     MAX_FRAME_IDX_KEY,
+    OPTICAL_FLOW_METHOD,
+    GrayscaleVideo,
     connect_viewer_callbacks,
+    find_video_layer,
     interpolate_track_between,
+    track_point_by_optical_flow,
+    track_row_indices,
     update_frame_slider_range,
 )
 from movement.napari.loader_widgets import DataLoader
@@ -477,3 +482,140 @@ def test_interpolate_track_between_with_too_few_points_for_method(
     )
     with pytest.raises(ValueError, match="method 'cubic'"):
         interpolate_track_between(layer, "a", "k", 0, 2, method="cubic")
+
+
+# ---- Optical flow between anchors --------------------
+
+
+def _blob_video(path, as_rgb=False):
+    """Return a video of a textured blob centred on each (y, x) of ``path``.
+
+    The blob moves over a static textured background, so that only
+    tracking the image content (not the background) follows the path.
+    """
+    rng = np.random.default_rng(seed=0)
+    background = rng.uniform(0, 40, size=(96, 128))
+    texture = rng.uniform(100, 255, size=(15, 15))
+    frames = []
+    for y, x in np.round(path).astype(int):
+        frame = background.copy()
+        frame[y - 7 : y + 8, x - 7 : x + 8] = texture
+        frames.append(frame.astype(np.uint8))
+    video = np.stack(frames)
+    return np.stack([video] * 3, axis=-1) if as_rgb else video
+
+
+@pytest.fixture
+def curved_path():
+    """Return the (y, x) positions of a point on a curved 10-frame path."""
+    frames = np.arange(10)
+    return np.column_stack(
+        [30 + 3 * frames + 10 * np.sin(frames / 9 * np.pi), 20 + 8 * frames]
+    ).round()
+
+
+@pytest.mark.parametrize("as_rgb", [False, True], ids=["grayscale", "rgb"])
+def test_track_point_by_optical_flow_follows_image_content(
+    curved_path, as_rgb
+):
+    """The tracked point follows the moving blob along its curved path,
+    which a straight line between the two known points would miss.
+    """
+    video = _blob_video(curved_path, as_rgb=as_rgb)
+
+    tracked = track_point_by_optical_flow(
+        video, 0, 9, start_point=curved_path[0], end_point=curved_path[9]
+    )
+
+    np.testing.assert_array_equal(tracked[[0, -1]], curved_path[[0, -1]])
+    np.testing.assert_allclose(tracked, curved_path, atol=1.0)
+    straight_line = np.linspace(curved_path[0], curved_path[9], 10)
+    assert np.abs(straight_line - curved_path).max() > 5
+
+
+def test_track_point_by_optical_flow_falls_back_when_point_is_lost(mocker):
+    """Frames reached by neither path lie on the straight line between
+    the two known points.
+    """
+    mocker.patch(
+        "movement.napari.layer_wiring.cv2.calcOpticalFlowPyrLK",
+        return_value=(np.zeros((1, 1, 2)), np.array([[0]]), None),
+    )
+    video = np.zeros((5, 32, 32), dtype=np.uint8)
+
+    tracked = track_point_by_optical_flow(video, 0, 4, (0, 0), (8, 16))
+
+    np.testing.assert_allclose(tracked, np.linspace((0, 0), (8, 16), 5))
+
+
+def test_track_point_by_optical_flow_requires_enough_frames():
+    """Tracking past the last frame of the video is an error."""
+    video = np.zeros((5, 32, 32), dtype=np.uint8)
+    with pytest.raises(ValueError, match="does not reach frame 7"):
+        track_point_by_optical_flow(video, 0, 7, (0, 0), (8, 16))
+
+
+def test_grayscale_video_converts_and_caches_frames():
+    """Frames of any dtype come back as cached 2D ``uint8`` images."""
+    video = np.random.default_rng(0).uniform(size=(3, 8, 8, 3))
+    grayscale_video = GrayscaleVideo(video)
+
+    frame = grayscale_video[1]
+
+    assert len(grayscale_video) == 3
+    assert frame.shape == (8, 8)
+    assert frame.dtype == np.uint8
+    assert grayscale_video[1] is frame
+
+
+def test_interpolate_track_between_with_optical_flow(
+    loader_with_corrected_anchors, curved_path
+):
+    """With the optical flow method, the points in between the anchors
+    are moved onto the path of the image content in the video.
+    """
+    layer = loader_with_corrected_anchors.points_layer
+    rows = track_row_indices(layer, "id_0", "centroid")
+    frames = layer.data[rows, 0].astype(int)
+    for anchor in (2, 6):
+        layer.data[rows[frames == anchor], 1:] = curved_path[anchor]
+
+    moved = interpolate_track_between(
+        layer,
+        "id_0",
+        "centroid",
+        2,
+        6,
+        OPTICAL_FLOW_METHOD,
+        video=_blob_video(curved_path),
+    )
+
+    assert sorted(layer.data[moved, 0]) == [3, 4, 5]
+    np.testing.assert_allclose(
+        layer.data[moved, 1:],
+        curved_path[layer.data[moved, 0].astype(int)],
+        atol=1.0,
+    )
+    assert layer.properties["edited"][moved].all()
+
+
+def test_interpolate_track_between_with_optical_flow_requires_video(
+    loader_with_corrected_anchors,
+):
+    """The optical flow method cannot be used without a video."""
+    layer = loader_with_corrected_anchors.points_layer
+    with pytest.raises(ValueError, match="no video"):
+        interpolate_track_between(
+            layer, "id_0", "centroid", 2, 6, OPTICAL_FLOW_METHOD
+        )
+
+
+def test_find_video_layer(make_napari_viewer_proxy):
+    """Only an Image layer holding a stack of frames counts as a video."""
+    viewer = make_napari_viewer_proxy()
+    viewer.add_image(np.zeros((8, 8)), name="still frame")
+    viewer.add_points(np.zeros((1, 3)), name="points")
+    assert find_video_layer(viewer) is None
+
+    viewer.add_image(np.zeros((4, 8, 8, 3)), name="video", rgb=True)
+    assert find_video_layer(viewer).name == "video"

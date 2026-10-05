@@ -17,9 +17,10 @@ import warnings
 from functools import partial
 from weakref import WeakSet
 
+import cv2
 import numpy as np
 from napari.components.dims import RangeTuple
-from napari.layers import Points
+from napari.layers import Image, Points
 from napari.layers.base import ActionType
 from scipy.interpolate import interp1d
 
@@ -43,6 +44,10 @@ MAX_FRAME_IDX_KEY: str = "movement_max_frame_idx"
 # Interpolation methods offered when filling a run of frames between two
 # anchor points (the ``kind`` argument of ``scipy.interpolate.interp1d``).
 INTERPOLATION_METHODS: tuple[str, ...] = ("linear", "nearest", "cubic")
+# An alternative to the above, which follows the image content of a video
+# from one anchor to the other (Lucas-Kanade optical flow) rather than
+# fitting a curve through the track's positions.
+OPTICAL_FLOW_METHOD: str = "optical flow"
 
 # Keep a set of viewers already wired by connect_viewer_callbacks,
 # so we don't wire them twice. We use a WeakSet so tracking a viewer here
@@ -72,6 +77,15 @@ def active_movement_points_layer(viewer):
     for layer in reversed(viewer.layers):
         if is_movement_points_layer(layer):
             return getattr(layer, "__wrapped__", layer)
+    return None
+
+
+def find_video_layer(viewer):
+    """Return the topmost Image layer holding a stack of frames, else None."""
+    for layer in reversed(viewer.layers):
+        layer = getattr(layer, "__wrapped__", layer)
+        if isinstance(layer, Image) and layer.ndim == 3:
+            return layer
     return None
 
 
@@ -280,6 +294,7 @@ def interpolate_track_between(
     start_frame: int,
     end_frame: int,
     method: str = "linear",
+    video=None,
 ) -> list[int]:
     """Overwrite a track's points between two anchor frames by interpolation.
 
@@ -308,9 +323,17 @@ def interpolate_track_between(
         The two anchor frames. Both must hold a point for this track.
     method
         Interpolation method, one of ``INTERPOLATION_METHODS``
-        (passed as ``kind`` to :class:`scipy.interpolate.interp1d`).
+        (passed as ``kind`` to :class:`scipy.interpolate.interp1d`)
+        or ``OPTICAL_FLOW_METHOD``.
         With ``cubic``, every point of the track outside the range
         supports the spline, not just the two anchors.
+        With ``OPTICAL_FLOW_METHOD``, the points follow the image
+        content of ``video`` between the two anchors
+        (see :func:`track_point_by_optical_flow`).
+    video
+        The frames the points were tracked on, indexed by frame number
+        (e.g. the data of a napari Image layer holding a video).
+        Only required if ``method`` is ``OPTICAL_FLOW_METHOD``.
 
     Returns
     -------
@@ -323,8 +346,9 @@ def interpolate_track_between(
     Raises
     ------
     ValueError
-        If either anchor frame has no point for this track, or if the
-        track has too few points for ``method``.
+        If either anchor frame has no point for this track, if the
+        track has too few points for ``method``, or if ``method`` is
+        ``OPTICAL_FLOW_METHOD`` and ``video`` is missing or too short.
 
     """
     if start_frame >= end_frame:
@@ -345,19 +369,34 @@ def interpolate_track_between(
     if not in_between.any():
         return []
     try:
-        interpolator = interp1d(
-            frames[~in_between],
-            layer.data[rows[~in_between], 1:],
-            kind=method,  # type: ignore[call-overload]
-            axis=0,
-        )
+        if method == OPTICAL_FLOW_METHOD:
+            if video is None:
+                raise ValueError("no video to follow the points on.")
+            tracked_points = track_point_by_optical_flow(
+                video,
+                start_frame,
+                end_frame,
+                start_point=layer.data[rows[frames == start_frame][0], 1:],
+                end_point=layer.data[rows[frames == end_frame][0], 1:],
+            )
+            new_points = tracked_points[
+                (frames[in_between] - start_frame).astype(int)
+            ]
+        else:
+            interpolator = interp1d(
+                frames[~in_between],
+                layer.data[rows[~in_between], 1:],
+                kind=method,  # type: ignore[call-overload]
+                axis=0,
+            )
+            new_points = interpolator(frames[in_between])
     except ValueError as e:
         raise ValueError(
             f"Cannot interpolate {track_name} with method '{method}': {e}"
         ) from e
 
     moved_indices = rows[in_between].tolist()
-    layer.data[moved_indices, 1:] = interpolator(frames[in_between])
+    layer.data[moved_indices, 1:] = new_points
     layer.refresh()
     layer.events.data(
         value=layer.data,
@@ -367,6 +406,136 @@ def interpolate_track_between(
     )
     layer.events.features()
     return moved_indices
+
+
+class GrayscaleVideo:
+    """Read-only view of a video as grayscale ``uint8`` frames.
+
+    Frames are converted the first time they are requested and kept, so
+    that tracking several points over the same frames (or the same point
+    forward and backward) reads each frame from the video only once.
+
+    Parameters
+    ----------
+    video
+        The video frames, indexed by frame number. Each frame is an
+        array of shape (height, width) or (height, width, channels),
+        with the channels in RGB(A) order.
+
+    """
+
+    def __init__(self, video):
+        """Wrap the video frames."""
+        self._video = video
+        self._frames: dict[int, np.ndarray] = {}
+
+    def __len__(self) -> int:
+        """Return the number of frames in the video."""
+        return len(self._video)
+
+    def __getitem__(self, frame_idx: int) -> np.ndarray:
+        """Return a frame of the video as a grayscale ``uint8`` image."""
+        if frame_idx not in self._frames:
+            frame = np.asarray(self._video[frame_idx])
+            if frame.dtype != np.uint8:
+                # Stretch the frame's values over the uint8 range
+                frame = frame.astype(float) - frame.min()
+                frame = (frame / (frame.max() or 1) * 255).astype(np.uint8)
+            if frame.ndim == 3:
+                frame = cv2.cvtColor(
+                    np.ascontiguousarray(frame[..., :3]), cv2.COLOR_RGB2GRAY
+                )
+            self._frames[frame_idx] = frame
+        return self._frames[frame_idx]
+
+
+def track_point_by_optical_flow(
+    video, start_frame: int, end_frame: int, start_point, end_point
+) -> np.ndarray:
+    """Follow a point through a video between two frames it is known on.
+
+    The point is tracked frame by frame with pyramidal Lucas-Kanade
+    optical flow (:func:`cv2.calcOpticalFlowPyrLK`), once forward from
+    ``start_point`` and once backward from ``end_point``. The two paths
+    are blended with a weight that shifts linearly from the forward path
+    (at ``start_frame``) to the backward path (at ``end_frame``), so
+    that the result lands exactly on both known points and the drift
+    each path accumulates is suppressed where it is largest.
+
+    If the point is lost along one path, the other path is used on its
+    own from there on. Frames reached by neither path fall back to the
+    straight line between the two known points.
+
+    Parameters
+    ----------
+    video
+        The video frames, indexed by frame number, or a
+        :class:`GrayscaleVideo` wrapping them.
+    start_frame, end_frame
+        The first and last frame to track the point over.
+    start_point, end_point
+        The (y, x) position of the point, in pixels, on ``start_frame``
+        and ``end_frame``.
+
+    Returns
+    -------
+    numpy.ndarray
+        Array of shape (end_frame - start_frame + 1, 2) holding the
+        (y, x) position of the point on each frame from ``start_frame``
+        to ``end_frame`` (both included).
+
+    Raises
+    ------
+    ValueError
+        If the video does not hold all frames up to ``end_frame``.
+
+    """
+    if not isinstance(video, GrayscaleVideo):
+        video = GrayscaleVideo(video)
+    if end_frame >= len(video):
+        raise ValueError(
+            f"the video has {len(video)} frames, "
+            f"so it does not reach frame {end_frame}."
+        )
+    start_point = np.asarray(start_point, dtype=float)
+    end_point = np.asarray(end_point, dtype=float)
+    frame_indices = list(range(start_frame, end_frame + 1))
+
+    forward = _follow_point(video, frame_indices, start_point)
+    backward = _follow_point(video, frame_indices[::-1], end_point)[::-1]
+
+    weights = np.linspace(0, 1, len(frame_indices))[:, np.newaxis]
+    blended = (1 - weights) * forward + weights * backward
+    straight_line = (1 - weights) * start_point + weights * end_point
+    # NaN marks the frames on which a path had lost the point
+    for fallback in (forward, backward, straight_line):
+        blended = np.where(np.isnan(blended), fallback, blended)
+    return blended
+
+
+def _follow_point(
+    video: GrayscaleVideo, frame_indices: list[int], point: np.ndarray
+) -> np.ndarray:
+    """Track a (y, x) point across consecutive frames of a video.
+
+    The point is given on the first of ``frame_indices``. Returns its
+    position on each of them, with NaN from the frame it is lost on.
+    """
+    path = np.full((len(frame_indices), 2), np.nan)
+    path[0] = point
+    for i in range(1, len(frame_indices)):
+        # OpenCV expects points as float32 (x, y), shaped (n_points, 1, 2)
+        previous_point = path[i - 1, ::-1].astype(np.float32).reshape(1, 1, 2)
+        next_point, status, _ = cv2.calcOpticalFlowPyrLK(  # type: ignore[call-overload]
+            video[frame_indices[i - 1]],
+            video[frame_indices[i]],
+            previous_point,
+            None,
+        )
+        if not status[0, 0]:
+            break
+        path[i] = next_point[0, 0, ::-1]
+    return path
 
 
 def set_tracks_layer_data(tracks_layer, data, properties):

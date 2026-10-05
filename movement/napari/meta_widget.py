@@ -19,7 +19,10 @@ from movement.napari.edit_timeline_widget import (
     EditTimelineWidget,
 )
 from movement.napari.layer_wiring import (
+    OPTICAL_FLOW_METHOD,
+    GrayscaleVideo,
     active_movement_points_layer,
+    find_video_layer,
     interpolate_track_between,
     is_movement_points_layer,
     track_row_indices,
@@ -233,6 +236,18 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
         else:
             keypoints = [keypoint]
 
+        video = None
+        if method == OPTICAL_FLOW_METHOD:
+            video_layer = find_video_layer(self._viewer)
+            if video_layer is None:
+                show_warning(
+                    f"The '{OPTICAL_FLOW_METHOD}' method follows the "
+                    "points on a video: load the video first."
+                )
+                return
+            # Shared by the keypoints, so each frame is read only once
+            video = GrayscaleVideo(video_layer.data)
+
         if not self._confirm_overwriting_edited_points(
             layer, individual, keypoints, start_frame, end_frame
         ):
@@ -243,7 +258,13 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
             try:
                 n_moved += len(
                     interpolate_track_between(
-                        layer, individual, kpt, start_frame, end_frame, method
+                        layer,
+                        individual,
+                        kpt,
+                        start_frame,
+                        end_frame,
+                        method,
+                        video=video,
                     )
                 )
             except ValueError as e:
