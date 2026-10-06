@@ -119,6 +119,14 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
             self._update_undo_button
         )
 
+        self.edit_controls.show_individuals_checkbox.setEnabled(False)
+        napari_viewer.layers.selection.events.active.connect(
+            self._show_individuals_enabled
+        )
+        napari_viewer.layers.selection.events.active.connect(
+            self._update_track_choices
+        )
+
         # One key per interpolation method, each also switching on
         # picking anchors on the timeline
         for key, method in METHOD_SHORTCUTS.items():
@@ -150,14 +158,6 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
         for key in METHOD_SHORTCUTS:
             bind_viewer_shortcut(self._viewer, key, None, "")
         super().closeEvent(event)
-
-        self.edit_controls.show_individuals_checkbox.setEnabled(False)
-        napari_viewer.layers.selection.events.active.connect(
-            self._show_individuals_enabled
-        )
-        napari_viewer.layers.selection.events.active.connect(
-            self._update_track_choices
-        )
 
     def _on_layer_inserted(self, event) -> None:
         """Keep the edit timeline section collapsed until a point is edited."""

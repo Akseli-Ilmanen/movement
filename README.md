@@ -13,21 +13,16 @@
 
 # movement
 
-A Python toolbox for analysing animal body movements across space and time.
-
-> [!Important]
-> **This is a fork** of [neuroinformatics-unit/movement](https://github.com/neuroinformatics-unit/movement)
-> that extends the napari plugin for correcting pose tracks across many
-> short clips. See [What this fork adds](#what-this-fork-adds) below.
-> Everything else is as upstream.
+A Python toolbox for analysing animal body movements across space and time..
 
 ## What this fork adds
 
 All of this lives in the napari plugin (`movement launch`), in the
 "Load folder of tracked data" and "Edit tracked data" sections.
 
-**Batch refinement of a folder of files**
-([upstream issue #1118](https://github.com/neuroinformatics-unit/movement/issues/1118))
+**Batch refinement of a folder of files** ([Issue #1118](https://github.com/neuroinformatics-unit/movement/issues/1118))
+
+
 - *Load folder*: queue every tracked data file in a folder, including its
   subfolders, and step through them with *Previous* / *Next*
   (or `Shift-Left` / `Shift-Right`). Only the current file's layers are
@@ -42,7 +37,7 @@ All of this lives in the napari plugin (`movement launch`), in the
 - *Load points only* skips the tracks layer, which is not needed for
   editing and makes files load faster.
 
-**Interpolation between corrected frames**
+**Interpolation between corrected frames** ([Issue #1117](https://github.com/neuroinformatics-unit/movement/issues/1117))
 - *Interpolate between anchors*: correct the frame before and after a run
   of misplaced frames, click those two frames on the edited-frames
   timeline, and the points in between are re-positioned.

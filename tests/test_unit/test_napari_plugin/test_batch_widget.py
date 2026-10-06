@@ -384,7 +384,7 @@ def test_keyboard_shortcuts_step_through_files(batch_loader_with_folder):
     viewer = batch_loader.viewer
     keymap = {str(key): func for key, func in viewer.keymap.items()}
 
-    keymap[NEXT_FILE_SHORTCUT](viewer)
+    keymap[NEXT_FILE_SHORTCUT.replace("-", "+")](viewer)
     assert batch_loader.index == 1
 
     keymap[PREVIOUS_FILE_SHORTCUT.replace("-", "+")](viewer)
