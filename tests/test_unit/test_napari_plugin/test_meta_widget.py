@@ -7,7 +7,10 @@ from qtpy.QtWidgets import QMessageBox
 
 from movement.io import save_poses
 from movement.napari.batch_widget import BatchLoader
-from movement.napari.edit_timeline_widget import ALL_KEYPOINTS
+from movement.napari.edit_timeline_widget import (
+    ALL_KEYPOINTS,
+    METHOD_SHORTCUTS,
+)
 from movement.napari.loader_widgets import DataLoader
 from movement.napari.meta_widget import MovementMetaWidget
 
@@ -712,3 +715,43 @@ def test_undo_history_is_dropped_with_its_layer(meta_widget_with_data):
 
     assert meta_widget_with_data._edit_histories == {}
     assert not controls.undo_button.isEnabled()
+
+
+# ---- Keyboard shortcuts for the interpolation methods --------------------
+
+
+def _viewer_keymap(viewer):
+    return {str(key): func for key, func in viewer.keymap.items()}
+
+
+@pytest.mark.parametrize("key, method", METHOD_SHORTCUTS.items())
+def test_method_shortcut_picks_method_and_anchor_mode(
+    meta_widget_with_data, key, method
+):
+    """Pressing a method's key selects it in the dropdown and switches
+    on picking anchors, so two clicks on the timeline interpolate.
+    """
+    controls = meta_widget_with_data.edit_controls
+    timeline = meta_widget_with_data.edit_timeline_widget
+    viewer = meta_widget_with_data._viewer
+    assert not controls.interpolate_button.isChecked()
+
+    _viewer_keymap(viewer)[key](viewer)
+
+    assert controls.method_combo.currentText() == method
+    assert controls.interpolate_button.isChecked()
+    assert timeline._interpolate_mode
+
+
+def test_method_shortcut_is_a_noop_without_data(make_napari_viewer_proxy):
+    """Before any data is loaded the shortcuts change nothing."""
+    viewer = make_napari_viewer_proxy()
+    meta_widget = MovementMetaWidget(viewer)
+    controls = meta_widget.edit_controls
+    method_before = controls.method_combo.currentText()
+
+    _viewer_keymap(viewer)["O"](viewer)
+
+    assert controls.method_combo.currentText() == method_before
+    assert not controls.interpolate_button.isChecked()
+    assert not meta_widget.collapsible_widgets[2].isExpanded()

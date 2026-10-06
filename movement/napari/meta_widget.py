@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 from movement.napari.batch_widget import BatchLoader
 from movement.napari.edit_history import EditHistory
 from movement.napari.edit_timeline_widget import (
+    METHOD_SHORTCUTS,
     EditControlsWidget,
     EditTimelineWidget,
 )
@@ -24,6 +25,7 @@ from movement.napari.layer_wiring import (
     OPTICAL_FLOW_METHOD,
     GrayscaleVideo,
     active_movement_points_layer,
+    bind_viewer_shortcut,
     edited_frames,
     find_video_layer,
     interpolate_track_between,
@@ -116,6 +118,38 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
         napari_viewer.layers.selection.events.active.connect(
             self._update_undo_button
         )
+
+        # One key per interpolation method, each also switching on
+        # picking anchors on the timeline
+        for key, method in METHOD_SHORTCUTS.items():
+            bind_viewer_shortcut(
+                napari_viewer,
+                key,
+                self,
+                f"_pick_{method.replace(' ', '_')}_method",
+            )
+
+    def _pick_linear_method(self) -> None:
+        """Pick the linear method and switch on picking anchors."""
+        self.edit_controls.pick_method_and_anchors("linear")
+
+    def _pick_nearest_method(self) -> None:
+        """Pick the nearest method and switch on picking anchors."""
+        self.edit_controls.pick_method_and_anchors("nearest")
+
+    def _pick_cubic_method(self) -> None:
+        """Pick the cubic method and switch on picking anchors."""
+        self.edit_controls.pick_method_and_anchors("cubic")
+
+    def _pick_optical_flow_method(self) -> None:
+        """Pick the optical flow method and switch on picking anchors."""
+        self.edit_controls.pick_method_and_anchors(OPTICAL_FLOW_METHOD)
+
+    def closeEvent(self, event):
+        """Release the keyboard shortcuts when the widget is closed."""
+        for key in METHOD_SHORTCUTS:
+            bind_viewer_shortcut(self._viewer, key, None, "")
+        super().closeEvent(event)
 
         self.edit_controls.show_individuals_checkbox.setEnabled(False)
         napari_viewer.layers.selection.events.active.connect(

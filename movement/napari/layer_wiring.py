@@ -14,6 +14,7 @@ can be closed).
 """
 
 import warnings
+import weakref
 from functools import partial
 from weakref import WeakSet
 
@@ -117,6 +118,27 @@ def edited_frames(
         return np.array([], dtype=int)
     rows = track_row_indices(layer, individual, keypoint)
     return np.sort(layer.data[rows[edited[rows]], 0]).astype(int)
+
+
+def bind_viewer_shortcut(viewer, shortcut: str, widget, method_name: str):
+    """Bind a viewer keyboard shortcut to a method of a widget.
+
+    The viewer only holds a weak reference to the widget, so that the
+    shortcut does not keep the widget (and whatever it references)
+    alive once the widget is gone: from then on the shortcut does
+    nothing. Pass ``None`` as the ``widget`` to release the shortcut.
+    """
+    if widget is None:
+        viewer.bind_key(shortcut, None, overwrite=True)
+        return
+    widget_ref = weakref.ref(widget)
+
+    def callback(viewer):
+        widget = widget_ref()
+        if widget is not None:
+            getattr(widget, method_name)()
+
+    viewer.bind_key(shortcut, callback, overwrite=True)
 
 
 # ---- Callbacks with viewer lifetime --------------------

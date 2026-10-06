@@ -1,7 +1,6 @@
 """Widget for stepping through a folder of tracked data files."""
 
 import re
-import weakref
 from pathlib import Path
 
 from napari.layers.base import ActionType
@@ -19,7 +18,10 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from movement.napari.layer_wiring import is_movement_points_layer
+from movement.napari.layer_wiring import (
+    bind_viewer_shortcut,
+    is_movement_points_layer,
+)
 from movement.napari.loader_widgets import SUPPORTED_DATA_FILES, DataLoader
 from movement.napari.save_widget import save_points_layer
 from movement.utils.logging import logger
@@ -34,8 +36,8 @@ NO_FOLDER_STATUS = "No folder loaded"
 
 # Keyboard shortcuts for stepping through the files, active while the
 # napari canvas has focus
-NEXT_FILE_SHORTCUT = "N"
-PREVIOUS_FILE_SHORTCUT = "Shift-N"
+NEXT_FILE_SHORTCUT = "Shift-Right"
+PREVIOUS_FILE_SHORTCUT = "Shift-Left"
 
 
 def _unwrap(obj):
@@ -119,29 +121,17 @@ class BatchLoader(QWidget):
         self._create_navigation_widgets()
         self._update_navigation_state()
 
-        self._bind_shortcut(NEXT_FILE_SHORTCUT, "_on_next_clicked")
-        self._bind_shortcut(PREVIOUS_FILE_SHORTCUT, "_on_previous_clicked")
-
-    def _bind_shortcut(self, shortcut: str, method_name: str):
-        """Bind a viewer keyboard shortcut to one of the widget's methods.
-
-        The viewer only holds a weak reference to the widget, so that the
-        shortcut does not keep the widget (and the data loader) alive
-        once the widget is gone. From then on the shortcut does nothing.
-        """
-        widget_ref = weakref.ref(self)
-
-        def callback(viewer):
-            widget = widget_ref()
-            if widget is not None:
-                getattr(widget, method_name)()
-
-        self.viewer.bind_key(shortcut, callback, overwrite=True)
+        bind_viewer_shortcut(
+            self.viewer, NEXT_FILE_SHORTCUT, self, "_on_next_clicked"
+        )
+        bind_viewer_shortcut(
+            self.viewer, PREVIOUS_FILE_SHORTCUT, self, "_on_previous_clicked"
+        )
 
     def closeEvent(self, event):
         """Release the keyboard shortcuts when the widget is closed."""
         for shortcut in (NEXT_FILE_SHORTCUT, PREVIOUS_FILE_SHORTCUT):
-            self.viewer.bind_key(shortcut, None, overwrite=True)
+            bind_viewer_shortcut(self.viewer, shortcut, None, "")
         super().closeEvent(event)
 
     def _create_file_suffix_widget(self):

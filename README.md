@@ -15,6 +15,50 @@
 
 A Python toolbox for analysing animal body movements across space and time.
 
+> [!Important]
+> **This is a fork** of [neuroinformatics-unit/movement](https://github.com/neuroinformatics-unit/movement)
+> that extends the napari plugin for correcting pose tracks across many
+> short clips. See [What this fork adds](#what-this-fork-adds) below.
+> Everything else is as upstream.
+
+## What this fork adds
+
+All of this lives in the napari plugin (`movement launch`), in the
+"Load folder of tracked data" and "Edit tracked data" sections.
+
+**Batch refinement of a folder of files**
+([upstream issue #1118](https://github.com/neuroinformatics-unit/movement/issues/1118))
+- *Load folder*: queue every tracked data file in a folder, including its
+  subfolders, and step through them with *Previous* / *Next*
+  (or `Shift-Left` / `Shift-Right`). Only the current file's layers are
+  kept in the viewer.
+- The matching video is loaded underneath each file. A video matches if
+  its name (without the suffix) starts the file's name, e.g.
+  `clip-1.mp4` for `clip-1DLC_resnet50_….h5`; separators and letter case
+  are ignored if nothing matches exactly.
+- Stepping away from a file saves any edits next to it as
+  `<name>_edited.nc` (movement's netCDF format). The original files are
+  never modified. Going back to a file reloads the original.
+- *Load points only* skips the tracks layer, which is not needed for
+  editing and makes files load faster.
+
+**Interpolation between corrected frames**
+- *Interpolate between anchors*: correct the frame before and after a run
+  of misplaced frames, click those two frames on the edited-frames
+  timeline, and the points in between are re-positioned.
+- Methods: `linear`, `nearest`, `cubic` (a spline through the track's
+  points outside the range) and `optical flow`, which follows the image
+  content of the loaded video between the anchors with Lucas-Kanade
+  tracking (forward and backward, blended so both anchors are hit).
+- Shortcuts over the viewer: `L`, `N`, `C`, `O` pick the method and
+  switch on anchor picking in one go, so a correction is
+  "press `O`, click two frames on the timeline".
+- *Interpolate between all edited points*: every corrected frame of the
+  chosen keypoint(s) acts as an anchor, and each stretch between
+  consecutive anchors is interpolated.
+- *Undo last edit*: reverts the last drag or the last interpolation as a
+  whole, up to 50 steps back. Deleting a point clears the history.
+
 
 ![](docs/source/_static/movement_overview.png)
 

@@ -52,6 +52,15 @@ ZOOM_OUT_FACTOR = 1.25
 DRAG_THRESHOLD_PIXELS = 3
 
 # Keypoint dropdown entry meaning "every keypoint of the individual".
+# Keyboard shortcuts that pick an interpolation method and switch on
+# picking anchors, so that two clicks on the timeline interpolate.
+METHOD_SHORTCUTS: dict[str, str] = {
+    "L": "linear",
+    "N": "nearest",
+    "C": "cubic",
+    "O": OPTICAL_FLOW_METHOD,
+}
+
 ALL_KEYPOINTS = "all keypoints"
 
 TIMELINE_TITLE = "Edited frames"
@@ -83,7 +92,10 @@ class EditControlsWidget(QWidget):
             "To fix a run of misplaced frames, correct the frame before and "
             "the frame after the run, then press 'Interpolate between "
             "anchors' and click those two frames on the timeline. The "
-            "points in between are re-positioned by interpolation.\n\n"
+            "points in between are re-positioned by interpolation. "
+            "Pressing L, N, C or O over the viewer picks the linear, "
+            "nearest, cubic or optical flow method and switches on picking "
+            "anchors in one go.\n\n"
             "Alternatively, correct several frames and press 'Interpolate "
             "between all edited points' to re-position the points between "
             "each edited frame and the next.\n\n"
@@ -116,7 +128,11 @@ class EditControlsWidget(QWidget):
         self.method_combo.setToolTip(
             f"'{OPTICAL_FLOW_METHOD}' follows the image content of the\n"
             "loaded video between the anchors (Lucas-Kanade tracking).\n"
-            "The other methods only use the positions of the points."
+            "The other methods only use the positions of the points.\n"
+            "Shortcuts (over the viewer): "
+            + ", ".join(
+                f"{key} = {method}" for key, method in METHOD_SHORTCUTS.items()
+            )
         )
         self.interpolate_button = QPushButton("Interpolate between anchors")
         self.interpolate_button.setObjectName("interpolate_button")
@@ -186,6 +202,18 @@ class EditControlsWidget(QWidget):
         self.keypoint_combo.setEnabled(keypoints is not None)
         self.interpolate_button.setEnabled(bool(individuals))
         self.interpolate_all_button.setEnabled(bool(individuals))
+
+    def pick_method_and_anchors(self, method: str) -> None:
+        """Select an interpolation method and switch on picking anchors.
+
+        Bound to the ``METHOD_SHORTCUTS`` keys by
+        :class:`~movement.napari.meta_widget.MovementMetaWidget`.
+        A no-op until data is loaded.
+        """
+        if not self.interpolate_button.isEnabled():
+            return
+        self.method_combo.setCurrentText(method)
+        self.interpolate_button.setChecked(True)
 
     @property
     def selected_keypoint(self) -> str | None:
