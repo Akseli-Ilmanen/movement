@@ -80,7 +80,6 @@ class EditControlsWidget(QWidget):
     show_individuals_toggled = Signal(bool)
     interpolate_mode_toggled = Signal(bool)
     interpolate_all_clicked = Signal()
-    undo_clicked = Signal()
 
     def __init__(self, parent=None):
         """Initialise the instructions label and the edit controls."""
@@ -98,9 +97,7 @@ class EditControlsWidget(QWidget):
             "anchors in one go.\n\n"
             "Alternatively, correct several frames and press 'Interpolate "
             "between all edited points' to re-position the points between "
-            "each edited frame and the next.\n\n"
-            "'Undo last edit' puts back the points moved by the last drag "
-            "or interpolation."
+            "each edited frame and the next."
         )
         instructions.setWordWrap(True)
 
@@ -158,17 +155,6 @@ class EditControlsWidget(QWidget):
         interpolate_form.addRow("method:", self.method_combo)
         interpolate_form.addRow(self.interpolate_button)
         interpolate_form.addRow(self.interpolate_all_button)
-
-        self.undo_button = QPushButton("Undo last edit")
-        self.undo_button.setObjectName("undo_button")
-        self.undo_button.setToolTip(
-            "Put the points moved by the last drag or interpolation back\n"
-            "where they were. Press again to undo the edit before that.\n"
-            "Deleting a point cannot be undone, and clears this history."
-        )
-        self.undo_button.setEnabled(False)  # until a point is moved
-        self.undo_button.clicked.connect(self.undo_clicked)
-        interpolate_form.addRow(self.undo_button)
 
         layout = QVBoxLayout()
         layout.addWidget(instructions)
@@ -408,12 +394,6 @@ class EditTimelineWidget(QWidget):
         individual's lane (or the shared lane) alongside the edited bars.
         """
         self._interpolated_spans.append((start_frame, end_frame, individual))
-        self._redraw_bars()
-
-    def remove_last_interpolated_spans(self, n_spans: int) -> None:
-        """Remove the ``n_spans`` most recently added interpolated spans."""
-        if n_spans > 0:
-            del self._interpolated_spans[-n_spans:]
         self._redraw_bars()
 
     def refresh(self) -> None:

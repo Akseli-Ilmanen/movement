@@ -15,7 +15,6 @@ if TYPE_CHECKING:
     from qtpy.QtWidgets import QWidget
 
 from movement.napari.batch_widget import BatchLoader
-from movement.napari.edit_history import EditHistory
 from movement.napari.edit_timeline_widget import (
     METHOD_SHORTCUTS,
     EditControlsWidget,
@@ -49,8 +48,6 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
         super().__init__()
         self._viewer = napari_viewer
         self.edit_timeline_widget: EditTimelineWidget | None = None
-        # Undo history of each movement Points layer, by layer id
-        self._edit_histories: dict[int, EditHistory] = {}
         self._edit_timeline_dock_widget: QWidget | None = None
 
         # Add the data loader widget
@@ -85,7 +82,6 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
         self.edit_controls.interpolate_all_clicked.connect(
             self._on_interpolate_all_clicked
         )
-        self.edit_controls.undo_clicked.connect(self._on_undo_clicked)
         self.add_widget(
             self.edit_controls,
             collapsible=True,
@@ -114,10 +110,6 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
         loader_collapsible.expand()  # expand the loader widget by default
 
         napari_viewer.layers.events.inserted.connect(self._on_layer_inserted)
-        napari_viewer.layers.events.removed.connect(self._on_layer_removed)
-        napari_viewer.layers.selection.events.active.connect(
-            self._update_undo_button
-        )
 
         self.edit_controls.show_individuals_checkbox.setEnabled(False)
         napari_viewer.layers.selection.events.active.connect(
@@ -169,47 +161,10 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
         # Open the edit timeline section as soon as a point is edited
         # on this layer.
         layer.events.data.connect(self._on_points_edited)
-        self._edit_history(layer)  # start recording edits, for undoing
         # Stepping through a folder of files keeps the section as it is,
         # so the timeline stays in view from one file to the next.
         if not self._batch_loader.is_loading_file:
             self._edit_timeline_collapsible.collapse(False)
-
-    def _on_layer_removed(self, event) -> None:
-        """Forget the undo history of a removed layer."""
-        layer = getattr(event.value, "__wrapped__", event.value)
-        self._edit_histories.pop(id(layer), None)
-        self._update_undo_button()
-
-    def _edit_history(self, layer) -> EditHistory:
-        """Return the undo history of a movement Points layer."""
-        layer = getattr(layer, "__wrapped__", layer)
-        if id(layer) not in self._edit_histories:
-            self._edit_histories[id(layer)] = EditHistory(
-                layer, on_change=self._update_undo_button
-            )
-        return self._edit_histories[id(layer)]
-
-    def _update_undo_button(self, *_) -> None:
-        """Enable "Undo last edit" if the active layer has an edit to undo."""
-        layer = active_movement_points_layer(self._viewer)
-        history = self._edit_histories.get(id(layer))
-        self.edit_controls.undo_button.setEnabled(
-            history is not None and history.can_undo
-        )
-
-    def _on_undo_clicked(self) -> None:
-        """Undo the last drag or interpolation on the active layer."""
-        layer = active_movement_points_layer(self._viewer)
-        history = self._edit_histories.get(id(layer))
-        step = history.undo() if history is not None else None
-        if step is None:
-            return
-        self._batch_loader.mark_edited(layer)
-        if self.edit_timeline_widget is not None:
-            self.edit_timeline_widget.remove_last_interpolated_spans(
-                step.n_interpolated_spans
-            )
 
     def _on_points_edited(self, event) -> None:
         """Expand the edit timeline section when a point is dragged or removed.
@@ -328,24 +283,21 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
             return
 
         n_moved, problems = 0, []
-        # Undone as a whole, however many keypoints are interpolated
-        with self._edit_history(layer).group() as edit_step:
-            for kpt in keypoints:
-                try:
-                    n_moved += len(
-                        interpolate_track_between(
-                            layer,
-                            individual,
-                            kpt,
-                            start_frame,
-                            end_frame,
-                            method,
-                            video=video,
-                        )
+        for kpt in keypoints:
+            try:
+                n_moved += len(
+                    interpolate_track_between(
+                        layer,
+                        individual,
+                        kpt,
+                        start_frame,
+                        end_frame,
+                        method,
+                        video=video,
                     )
-                except ValueError as e:
-                    problems.append(str(e))
-            edit_step.n_interpolated_spans = 1 if n_moved else 0
+                )
+            except ValueError as e:
+                problems.append(str(e))
         if problems:
             show_warning("\n".join(problems))
         if n_moved:
@@ -369,29 +321,26 @@ class MovementMetaWidget(CollapsibleWidgetContainer):
 
         spans: set[tuple[int, int]] = set()
         problems: list[str] = []
-        # Undone as a whole, however many stretches are interpolated
-        with self._edit_history(layer).group() as edit_step:
-            for kpt in keypoints:
-                # Fix the anchors upfront: interpolated points get flagged
-                # as edited too, but must not become anchors themselves.
-                anchors = edited_frames(layer, individual, kpt)
-                for start_frame, end_frame in pairwise(anchors.tolist()):
-                    try:
-                        moved = interpolate_track_between(
-                            layer,
-                            individual,
-                            kpt,
-                            start_frame,
-                            end_frame,
-                            method,
-                            video=video,
-                        )
-                    except ValueError as e:
-                        problems.append(str(e))
-                    else:
-                        if moved:
-                            spans.add((start_frame, end_frame))
-            edit_step.n_interpolated_spans = len(spans)
+        for kpt in keypoints:
+            # Fix the anchors upfront: interpolated points get flagged
+            # as edited too, but must not become anchors themselves.
+            anchors = edited_frames(layer, individual, kpt)
+            for start_frame, end_frame in pairwise(anchors.tolist()):
+                try:
+                    moved = interpolate_track_between(
+                        layer,
+                        individual,
+                        kpt,
+                        start_frame,
+                        end_frame,
+                        method,
+                        video=video,
+                    )
+                except ValueError as e:
+                    problems.append(str(e))
+                else:
+                    if moved:
+                        spans.add((start_frame, end_frame))
         self._report_interpolate_all(spans, problems, individual)
 
     def _report_interpolate_all(self, spans, problems, individual) -> None:

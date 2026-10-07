@@ -442,16 +442,6 @@ class BatchLoader(QWidget):
             self._has_unsaved_edits = True
             self._update_navigation_state()
 
-    def mark_edited(self, layer) -> None:
-        """Flag the current file as edited, if ``layer`` holds its points.
-
-        For edits that are not announced through the layer's data
-        events, such as undoing an earlier edit.
-        """
-        if _unwrap(layer) is self._current_points_layer():
-            self._has_unsaved_edits = True
-            self._update_navigation_state()
-
     def _save_edits(self) -> bool:
         """Save any unsaved edits to the current file as a netCDF file.
 

@@ -51,8 +51,6 @@ All of this lives in the napari plugin (`movement launch`), in the
 - *Interpolate between all edited points*: every corrected frame of the
   chosen keypoint(s) acts as an anchor, and each stretch between
   consecutive anchors is interpolated.
-- *Undo last edit*: reverts the last drag or the last interpolation as a
-  whole, up to 50 steps back. Deleting a point clears the history.
 
 
 ![](docs/source/_static/movement_overview.png)
